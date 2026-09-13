@@ -7,6 +7,16 @@ from __future__ import annotations
 
 import os
 
+# На Windows с русской локалью PostgreSQL по умолчанию присылает системные
+# сообщения (lc_messages) в кодировке Windows-1251, а psycopg2/libpq пытаются
+# декодировать их как UTF-8 — в итоге вместо реальной ошибки (неверный пароль,
+# порт и т.п.) вылетает UnicodeDecodeError "invalid continuation byte", которая
+# маскирует настоящую причину. lc_messages=C заставляет сервер отвечать
+# по-английски (ASCII), что декодируется как UTF-8 без проблем. Ставится ДО
+# первого psycopg2.connect() в процессе — переменные окружения читает libpq.
+os.environ.setdefault("PGCLIENTENCODING", "UTF8")
+os.environ.setdefault("PGOPTIONS", "-c lc_messages=C")
+
 import psycopg2
 import psycopg2.extras
 from datetime import datetime

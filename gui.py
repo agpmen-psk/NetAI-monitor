@@ -1800,15 +1800,28 @@ class ConfigsTab(QWidget):
 # Настройки
 # ---------------------------------------------------------------------------
 
-class SettingsTab(QWidget):
+class SettingsTab(QScrollArea):
+    """QScrollArea (не QWidget) — карточек здесь больше, чем помещается по
+    высоте на многих экранах; без прокрутки Qt сжимает layout, чтобы влезть
+    в доступную высоту, и поля визуально «плющит» друг в друга."""
+
     def __init__(self, settings_manager: SettingsManager, on_saved=None, offline_mode: bool = False):
         super().__init__()
         self.settings_manager = settings_manager
         self.on_saved = on_saved
         self.offline_mode = offline_mode
-        root = QVBoxLayout(self)
+
+        self.setWidgetResizable(True)
+        self.setFrameShape(QFrame.NoFrame)
+        self.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.viewport().setStyleSheet("background: transparent;")
+
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        root = QVBoxLayout(inner)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
+        self.setWidget(inner)
 
         # --- PostgreSQL: подключение читается ДО выбора бэкенда (local_config.py),
         # поэтому хранится отдельно от остальных настроек (app_settings живёт
