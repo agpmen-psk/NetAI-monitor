@@ -46,6 +46,16 @@ CONFIG_AUDIT_SYSTEM_PROMPT = (
     "в конфиге. Оцени общий риск конфигурации."
 )
 
+CHAT_SYSTEM_PROMPT = (
+    "Ты — ассистент сетевого инженера NOC, отвечающий на вопросы о "
+    "состоянии сети на основе истории мониторинга (инциденты Zabbix, "
+    "проверки конфигураций Oxidized). Отвечай ТОЛЬКО на основе данных, "
+    "которые тебе передали ниже — если ответа в них нет, честно скажи, "
+    "что таких данных нет, не выдумывай факты. Отвечай кратко и по делу, "
+    "разговорным профессиональным языком, без markdown-разметки и списков "
+    "из звёздочек."
+)
+
 LANGUAGE_INSTRUCTION = (
     "\n\nВАЖНО: отвечай ТОЛЬКО на русском языке. Не используй английский, "
     "китайский или любой другой язык ни в одном слове ответа.\n"
@@ -296,6 +306,35 @@ class OllamaAnalyzer(BaseAnalyzer):
                 rag_context = ""
         return self._review_text(config_text, CONFIG_AUDIT_SYSTEM_PROMPT, "Полный конфиг устройства", rag_context)
 
+    def answer_chat(self, question: str, context: str, history: List[tuple] | None = None) -> str:
+        """Отвечает на вопрос оператора, используя ТОЛЬКО переданный context
+        (собран детерминированно в chat_query.py — без RAG/эмбеддингов, чтобы
+        чат одинаково работал и в PostgreSQL-, и в SQLite-режиме)."""
+        history_block = ""
+        if history:
+            pairs = "\n\n".join(f"Вопрос: {q}\nОтвет: {a}" for q, a in history[-3:])
+            history_block = f"Предыдущие вопросы этой беседы (для контекста):\n{pairs}\n\n"
+
+        prompt = (
+            f"{CHAT_SYSTEM_PROMPT}{LANGUAGE_INSTRUCTION}\n\n"
+            f"Данные из истории мониторинга:\n{context}\n\n"
+            f"{history_block}"
+            f"Текущий вопрос инженера: {question}\n\nОтвет:"
+        )
+        response = self._requests.post(
+            f"{self.host}/api/generate",
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "stream": False,
+                "options": {"num_predict": 900, "num_ctx": 8192, "temperature": 0.3},
+            },
+            timeout=200,
+        )
+        response.raise_for_status()
+        text = response.json().get("response", "").strip().replace("**", "").replace("__", "")
+        return text or "Модель вернула пустой ответ."
+
 
 class RuleBasedAnalyzer(BaseAnalyzer):
     """Офлайн-заглушка на случай, если Ollama недоступна."""
@@ -350,6 +389,12 @@ class RuleBasedAnalyzer(BaseAnalyzer):
 
     def analyze_full_config(self, config_text: str, rag=None) -> dict:
         return self.analyze_config_diff(config_text)
+
+    def answer_chat(self, question: str, context: str, history: List[tuple] | None = None) -> str:
+        return (
+            "Ollama недоступна, поэтому отвечаю без ИИ-обобщения — вот отфильтрованные "
+            f"данные по вашему вопросу «{question}»:\n\n{context}"
+        )
 
 
 def get_analyzer(ollama_host: str, ollama_model: str) -> BaseAnalyzer:

@@ -41,6 +41,7 @@ from mock_oxidized_client import MockOxidizedClient
 from oxidized_client import OxidizedClient
 from rag import EmbeddingClient
 from local_config import load_postgres_config, save_postgres_config, build_dsn
+from chat_query import build_context as build_chat_context
 
 # ---------------------------------------------------------------------------
 # Токены дизайна
@@ -882,6 +883,25 @@ class ConnectionCheckWorker(QThread):
         except Exception as e:
             ok, message = False, str(e)[:150]
         self.finished.emit(ok, message)
+
+
+class ChatWorker(QThread):
+    """Строит контекст (chat_query.build_context — без RAG, работает в любом
+    режиме) и просит analyzer сформулировать ответ. Всё в фоне, чтобы вызов
+    Ollama не морозил интерфейс чата."""
+
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, task_fn):
+        super().__init__()
+        self.task_fn = task_fn
+
+    def run(self):
+        try:
+            self.finished.emit(self.task_fn())
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class ComparisonDialog(QDialog):
@@ -2710,6 +2730,169 @@ class AnalyticsTab(QScrollArea):
 
 
 # ---------------------------------------------------------------------------
+# Чат — «Спросите у NetAI Monitor»
+# ---------------------------------------------------------------------------
+
+class ChatBubble(QWidget):
+    def __init__(self, text: str, is_user: bool, muted: bool = False):
+        super().__init__()
+        self.setStyleSheet("background: transparent;")
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 4, 0, 4)
+
+        bubble = Card(radius=14, accent_left=(ACCENT if is_user else None))
+        bl = QVBoxLayout(bubble)
+        bl.setContentsMargins(14, 10, 14, 10)
+        color = TEXT_MUTED if muted else TEXT_PRIMARY
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setStyleSheet(f"color: {color}; font-size: 12px; border: none; background: transparent;")
+        bl.addWidget(label)
+        bubble.setMaximumWidth(760)
+
+        if is_user:
+            outer.addStretch()
+            outer.addWidget(bubble)
+        else:
+            outer.addWidget(bubble)
+            outer.addStretch()
+
+
+class ChatTab(QWidget):
+    """Чат на естественном языке по истории мониторинга. Контекст собирается
+    детерминированно (chat_query.py, без RAG/эмбеддингов) — работает
+    одинаково в PostgreSQL- и SQLite-режимах. Короткая память (последние
+    3 пары вопрос-ответ) передаётся в промпт для связных уточняющих
+    вопросов в рамках одной сессии."""
+
+    SUGGESTIONS = [
+        "Критичные инциденты за сутки",
+        "Риски в конфигурациях",
+        "Топ проблемных хостов",
+        "Что нового за неделю?",
+    ]
+
+    def __init__(self, incident_repo, config_repo, analyzer):
+        super().__init__()
+        self.incident_repo = incident_repo
+        self.config_repo = config_repo
+        self.analyzer = analyzer
+        self._history: list[tuple[str, str]] = []
+        self._workers: list[ChatWorker] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(28, 24, 28, 24)
+        root.setSpacing(14)
+
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        title_col.addWidget(_label("Спросите у NetAI Monitor", size=18, weight=700))
+        title_col.addWidget(_label(
+            "Вопросы на естественном языке по истории инцидентов и конфигураций",
+            size=11, color=TEXT_MUTED,
+        ))
+        root.addLayout(title_col)
+
+        chips_row = QHBoxLayout()
+        chips_row.setSpacing(8)
+        for question in self.SUGGESTIONS:
+            chip = QPushButton(question)
+            chip.setStyleSheet(SECONDARY_BUTTON_STYLE)
+            chip.clicked.connect(lambda _, q=question: self._ask(q))
+            chips_row.addWidget(chip)
+        chips_row.addStretch()
+        root.addLayout(chips_row)
+
+        self.messages_scroll = QScrollArea()
+        self.messages_scroll.setWidgetResizable(True)
+        self.messages_scroll.setFrameShape(QFrame.NoFrame)
+        self.messages_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
+        self.messages_scroll.viewport().setStyleSheet("background: transparent;")
+        inner = QWidget()
+        inner.setStyleSheet("background: transparent;")
+        self.messages_col = QVBoxLayout(inner)
+        self.messages_col.setSpacing(4)
+        self.messages_col.addStretch()
+        self.messages_scroll.setWidget(inner)
+        root.addWidget(self.messages_scroll, stretch=1)
+
+        self._add_message(
+            "Привет! Спросите меня об инцидентах или конфигурациях — например, "
+            "«какие критичные инциденты были на SW-CORE-01 за сутки?».",
+            is_user=False,
+        )
+
+        input_row = QHBoxLayout()
+        self.input_edit = QLineEdit()
+        self.input_edit.setPlaceholderText("Например: что произошло на SW-CORE-01 за неделю?")
+        self.input_edit.returnPressed.connect(self._send_current)
+        input_row.addWidget(self.input_edit, stretch=1)
+
+        self.send_btn = QPushButton("Отправить")
+        self.send_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
+        self.send_btn.clicked.connect(self._send_current)
+        input_row.addWidget(self.send_btn)
+        root.addLayout(input_row)
+
+    def _send_current(self):
+        question = self.input_edit.text().strip()
+        if not question:
+            return
+        self.input_edit.clear()
+        self._ask(question)
+
+    def _ask(self, question: str):
+        self._add_message(question, is_user=True)
+        self.send_btn.setEnabled(False)
+        self.input_edit.setEnabled(False)
+        thinking = self._add_message("Думаю...", is_user=False, muted=True)
+
+        history_snapshot = list(self._history)
+        worker = ChatWorker(lambda: self._answer_task(question, history_snapshot))
+        worker.finished.connect(lambda answer: self._on_answer(worker, question, thinking, answer))
+        worker.error.connect(lambda msg: self._on_error(worker, thinking, msg))
+        self._workers.append(worker)
+        worker.start()
+
+    def _answer_task(self, question: str, history: list[tuple[str, str]]) -> str:
+        context = build_chat_context(question, self.incident_repo, self.config_repo)
+        return self.analyzer.answer_chat(question, context, history=history)
+
+    def _on_answer(self, worker: ChatWorker, question: str, thinking_bubble: ChatBubble, answer: str):
+        if worker in self._workers:
+            self._workers.remove(worker)
+        self._remove_bubble(thinking_bubble)
+        self._add_message(answer, is_user=False)
+        self._history.append((question, answer))
+        self._history = self._history[-3:]
+        self.send_btn.setEnabled(True)
+        self.input_edit.setEnabled(True)
+        self.input_edit.setFocus()
+
+    def _on_error(self, worker: ChatWorker, thinking_bubble: ChatBubble, message: str):
+        if worker in self._workers:
+            self._workers.remove(worker)
+        self._remove_bubble(thinking_bubble)
+        self._add_message(f"Ошибка: {message}", is_user=False)
+        self.send_btn.setEnabled(True)
+        self.input_edit.setEnabled(True)
+
+    def _remove_bubble(self, bubble: ChatBubble):
+        bubble.setParent(None)
+        bubble.deleteLater()
+
+    def _add_message(self, text: str, is_user: bool, muted: bool = False) -> ChatBubble:
+        bubble = ChatBubble(text, is_user=is_user, muted=muted)
+        self.messages_col.insertWidget(self.messages_col.count() - 1, bubble)
+        QTimer.singleShot(10, self._scroll_to_bottom)
+        return bubble
+
+    def _scroll_to_bottom(self):
+        bar = self.messages_scroll.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+
+# ---------------------------------------------------------------------------
 # Сайдбар
 # ---------------------------------------------------------------------------
 
@@ -2873,7 +3056,7 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         nav_labels = ["Дашборд", "Алерты", "Конфигурации", "Настройки",
-                      "Синтетические данные", "Генератор", "Аналитика"]
+                      "Синтетические данные", "Генератор", "Аналитика", "Чат"]
         self.sidebar = Sidebar(nav_labels, incident_repo, settings_manager)
         root.addWidget(self.sidebar)
 
@@ -2895,6 +3078,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.generator_tab)
         self.analytics_tab = AnalyticsTab(incident_repo, config_repo)
         self.stack.addWidget(self.analytics_tab)
+        self.chat_tab = ChatTab(incident_repo, config_repo, analyzer)
+        self.stack.addWidget(self.chat_tab)
         root.addWidget(self.stack, stretch=1)
 
         self.alerts_tab.incident_added.connect(self._on_live_data_changed)
