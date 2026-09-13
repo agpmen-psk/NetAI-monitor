@@ -20,9 +20,16 @@ OutputBaseFilename=NetAI-Monitor-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+SetupIconFile=assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
+VersionInfoVersion={#MyAppVersion}
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoDescription=Установщик {#MyAppName}
+AppPublisherURL=https://github.com/agpmen-psk/NetAI-monitor
+AppSupportURL=https://github.com/agpmen-psk/NetAI-monitor
+AppUpdatesURL=https://github.com/agpmen-psk/NetAI-monitor
 
 [Languages]
 Name: "russian"; MessagesFile: "compiler:Languages\Russian.isl"

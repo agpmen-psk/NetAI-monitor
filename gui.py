@@ -13,14 +13,16 @@ gui.py — интерфейс NetAI Monitor v2 с RAG.
 from __future__ import annotations
 
 import copy
+import os
 import random
+import sys
 from collections import Counter
 from datetime import datetime, timedelta
 
 from PySide6.QtCore import Qt, QThread, Signal, QPointF, QRectF, QTimer
 from PySide6.QtGui import (
     QFont, QPainter, QPen, QColor, QPainterPath, QLinearGradient, QRadialGradient,
-    QBrush, QTextDocument,
+    QBrush, QTextDocument, QIcon,
 )
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
@@ -132,6 +134,18 @@ QPushButton:hover {{ border: 1px solid {ACCENT}; color: {TEXT_PRIMARY}; }}
 """
 
 RISK_COLORS = {"LOW": POSITIVE, "MEDIUM": WARNING, "HIGH": NEGATIVE, "UNKNOWN": TEXT_MUTED}
+
+
+def resource_path(relative: str) -> str:
+    """Путь к файлу ресурса — работает и из исходников, и из собранного
+    PyInstaller-exe (там файлы из datas распаковываются в sys._MEIPASS)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
+def app_icon() -> QIcon:
+    path = resource_path(os.path.join("assets", "icon.ico"))
+    return QIcon(path) if os.path.exists(path) else QIcon()
 
 MESSAGE_BOX_STYLESHEET = f"""
 QMessageBox {{ background-color: #10141F; }}
@@ -2848,6 +2862,7 @@ class MainWindow(QMainWindow):
                  offline_mode: bool = False):
         super().__init__()
         self.setWindowTitle("NetAI Monitor — интеллектуальный анализ сетевой инфраструктуры")
+        self.setWindowIcon(app_icon())
         self.resize(1360, 840)
         self.setStyleSheet(APP_STYLESHEET)
         self.offline_mode = offline_mode
@@ -2929,8 +2944,9 @@ def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbi
     # наследуют его надёжно: Qt не всегда прокидывает QSS родительского
     # окна в отдельные top-level диалоги, и кнопки/фон остаются дефолтными.
     app.setStyleSheet(APP_STYLESHEET)
+    app.setWindowIcon(app_icon())
     window = MainWindow(incident_repo, config_repo, settings_manager, zabbix_client, oxidized_client,
                          analyzer, incident_rag=incident_rag, config_rag=config_rag,
                          offline_mode=offline_mode)
-    window.show()
+    window.showMaximized()
     app.exec()

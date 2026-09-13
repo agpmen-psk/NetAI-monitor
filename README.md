@@ -34,10 +34,31 @@
 
 ```bash
 pip install -r requirements.txt
-# Пароль от боевой PostgreSQL — через переменную окружения, не в коде:
-setx NETAI_DB_DSN "dbname=netai_monitor user=postgres password=... host=localhost"
 python main.py
 ```
+
+Параметры подключения к PostgreSQL задаются либо на вкладке **Настройки →
+PostgreSQL** в самом приложении (сохраняются в `%APPDATA%\NetAI Monitor\
+postgres_connection.json`), либо переменной окружения `NETAI_DB_DSN` (имеет
+приоритет, удобно для CI/скриптов):
+
+```bash
+setx NETAI_DB_DSN "dbname=netai_monitor user=postgres password=... host=localhost"
+```
+
+Если PostgreSQL на Windows с русской локалью — проверьте, что `lc_messages`
+в `postgresql.conf` не `Russian_Russia.1251` (иначе psycopg2 иногда падает
+с `UnicodeDecodeError` вместо реальной причины отказа подключения);
+поставьте `lc_messages = 'C'` и перезапустите службу PostgreSQL.
+
+Окно запускается развёрнутым на весь экран.
+
+## Логотип / иконка
+
+`assets/icon.ico` — сгенерирован скриптом `tools/generate_icon.py` (нужен
+Pillow: `pip install pillow`). Чтобы поменять дизайн — правьте константы
+цветов и геометрию узлов в этом скрипте и перезапустите его, затем
+пересоберите .exe и установщик.
 
 ## Сборка в .exe
 
@@ -46,6 +67,10 @@ pip install pyinstaller
 pyinstaller netai_monitor.spec --clean
 # результат: dist/NetAI-Monitor/NetAI-Monitor.exe
 ```
+
+Иконка (`assets/icon.ico`) и метаданные версии файла (`version_info.txt` —
+компания, описание, версия — видно во вкладке «Подробнее» в свойствах
+exe) встраиваются автоматически через `netai_monitor.spec`.
 
 ## Сборка установщика (Windows)
 
@@ -58,4 +83,5 @@ pyinstaller netai_monitor.spec --clean
 
 Установщик работает без прав администратора, ставит приложение в
 пользовательский профиль, создаёт ярлыки в меню «Пуск» и (по желанию) на
-рабочем столе, регистрируется в «Установка и удаление программ».
+рабочем столе, регистрируется в «Установка и удаление программ» — со своей
+иконкой и корректной информацией об издателе/версии.
