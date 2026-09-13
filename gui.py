@@ -59,6 +59,9 @@ SIDEBAR_BG = "#0A0E10"
 PANEL_BG = "rgba(255, 255, 255, 0.035)"
 PANEL_BORDER = "rgba(255, 255, 255, 0.07)"
 TRACK_BG = "#1D2325"
+# Непрозрачная подложка для чата — без неё сетка/виньетка фона (GlowBackground)
+# просвечивает сквозь всю область сообщений и спорит с пузырями.
+SURFACE = "#12171A"
 TEXT_PRIMARY = "#E8EAEA"
 TEXT_SECONDARY = "#8B9294"
 TEXT_MUTED = "#565C5E"
@@ -805,9 +808,12 @@ class IncidentRow(QFrame):
     def __init__(self, incident: Incident):
         super().__init__()
         self.incident = incident
+        self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
-            f"IncidentRow {{ background: transparent; border: none; "
-            f"border-left: 3px solid {incident.severity.color}; border-bottom: 1px solid {PANEL_BORDER}; }}"
+            f"IncidentRow {{ background: rgba(255,255,255,0.018); border: none; "
+            f"border-left: 3px solid {incident.severity.color}; "
+            f"border-bottom: 1px solid rgba(255,255,255,0.09); }}"
+            f"IncidentRow:hover {{ background: rgba(255,255,255,0.055); }}"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -840,9 +846,11 @@ class ConfigDiffRow(QFrame):
         review_type = diff_row.get("review_type", "diff")
         type_label_text = "аудит" if review_type == "full_audit" else "diff"
 
+        self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
-            f"ConfigDiffRow {{ background: transparent; border: none; "
-            f"border-left: 3px solid {color}; border-bottom: 1px solid {PANEL_BORDER}; }}"
+            f"ConfigDiffRow {{ background: rgba(255,255,255,0.018); border: none; "
+            f"border-left: 3px solid {color}; border-bottom: 1px solid rgba(255,255,255,0.09); }}"
+            f"ConfigDiffRow:hover {{ background: rgba(255,255,255,0.055); }}"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -1120,8 +1128,32 @@ class DashboardTab(QScrollArea):
             key=lambda i: i.timestamp, reverse=True,
         )
         side_col.addWidget(AttentionCard(critical_unresolved))
+        side_col.addWidget(self._build_risk_card(configs))
         side_col.addWidget(RecentActivityCard(sorted(incidents, key=lambda i: i.timestamp, reverse=True)))
         self.bottom_row.addLayout(side_col, stretch=1)
+
+    def _build_risk_card(self, configs: list) -> "Card":
+        risk_counts = {"HIGH": 0, "MEDIUM": 0, "LOW": 0, "UNKNOWN": 0}
+        for c in configs:
+            level = (c.get("ai_risk_level") or "UNKNOWN").upper()
+            risk_counts[level] = risk_counts.get(level, 0) + 1
+        risk_titles = {"HIGH": "Высокий", "MEDIUM": "Средний", "LOW": "Низкий", "UNKNOWN": "Неизвестно"}
+
+        card = Card(radius=18)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(4)
+        layout.addWidget(_label("Риск конфигураций", size=13, weight=600))
+        layout.addWidget(_label("Оценка ИИ по последним проверкам", size=10.5, color=TEXT_MUTED))
+        total = sum(risk_counts.values()) or 1
+        for level in ("HIGH", "MEDIUM", "LOW", "UNKNOWN"):
+            count = risk_counts[level]
+            if count == 0 and level == "UNKNOWN":
+                continue
+            layout.addWidget(HorizontalBarRow(
+                risk_titles[level], count, total, color=RISK_COLORS.get(level, TEXT_MUTED),
+            ))
+        return card
 
 
 # ---------------------------------------------------------------------------
@@ -2927,11 +2959,16 @@ class ChatTab(QWidget):
         self.messages_scroll = QScrollArea()
         self.messages_scroll.setWidgetResizable(True)
         self.messages_scroll.setFrameShape(QFrame.NoFrame)
-        self.messages_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-        self.messages_scroll.viewport().setStyleSheet("background: transparent;")
+        # Непрозрачный SURFACE, а не "transparent" — иначе сетка фона просвечивает
+        # сквозь всю переписку и сливается с пузырями сообщений.
+        self.messages_scroll.setStyleSheet(
+            f"QScrollArea {{ background: {SURFACE}; border: 1px solid {PANEL_BORDER}; border-radius: 14px; }}"
+        )
+        self.messages_scroll.viewport().setStyleSheet(f"background: {SURFACE};")
         inner = QWidget()
-        inner.setStyleSheet("background: transparent;")
+        inner.setStyleSheet(f"background: {SURFACE};")
         self.messages_col = QVBoxLayout(inner)
+        self.messages_col.setContentsMargins(16, 12, 16, 12)
         self.messages_col.setSpacing(4)
         self.messages_col.addStretch()
         self.messages_scroll.setWidget(inner)
