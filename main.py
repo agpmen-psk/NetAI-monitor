@@ -1,7 +1,12 @@
 """
 main.py — точка входа NetAI Monitor v2 с RAG.
+
+Хранилище выбирается автоматически (см. backend.py): PostgreSQL, если он
+доступен, иначе — локальный SQLite в офлайн-режиме (без RAG, но со всей
+остальной функциональностью). Это позволяет собранному .exe запускаться на
+любом компьютере, даже без развёрнутой инфраструктуры предприятия.
 """
-from db import Database
+from backend import create_backend
 from settings import SettingsManager
 from zabbix_client import ZabbixClient, MockZabbixClient
 from oxidized_client import OxidizedClient
@@ -12,11 +17,12 @@ from gui import run_app
 
 
 def main():
-    # Реальный пароль задаётся переменной окружения NETAI_DB_DSN, например:
+    # Реальный пароль PostgreSQL задаётся переменной окружения NETAI_DB_DSN:
     #   setx NETAI_DB_DSN "dbname=netai_monitor user=postgres password=... host=localhost"
-    # Без неё используется безопасный дефолт (пароль "postgres" для локальной БД).
-    db = Database()
-    settings_manager = SettingsManager(db)
+    # Если PostgreSQL недоступен вообще — приложение само переключится на
+    # локальный SQLite-файл (%APPDATA%/NetAI Monitor/netai_local.db).
+    db, incident_repo, config_repo, settings_repo, is_postgres = create_backend()
+    settings_manager = SettingsManager(settings_repo)
     settings = settings_manager.load()
 
     if settings.use_synthetic_data:
@@ -32,18 +38,25 @@ def main():
 
     analyzer = get_analyzer(settings.ollama_host, settings.ollama_model)
 
-    embedder = EmbeddingClient(host=settings.ollama_host, model=settings.embedding_model)
-    incident_rag = IncidentRAG(db, embedder) if embedder.is_available() else None
-    config_rag = ConfigRAG(db, embedder) if embedder.is_available() else None
+    incident_rag = None
+    config_rag = None
+    if is_postgres:
+        # RAG требует pgvector — доступен только вместе с настоящим PostgreSQL.
+        embedder = EmbeddingClient(host=settings.ollama_host, model=settings.embedding_model)
+        if embedder.is_available():
+            incident_rag = IncidentRAG(db, embedder)
+            config_rag = ConfigRAG(db, embedder)
 
     run_app(
-        db=db,
+        incident_repo=incident_repo,
+        config_repo=config_repo,
         settings_manager=settings_manager,
         zabbix_client=zabbix_client,
         oxidized_client=oxidized_client,
         analyzer=analyzer,
         incident_rag=incident_rag,
         config_rag=config_rag,
+        offline_mode=not is_postgres,
     )
 
 

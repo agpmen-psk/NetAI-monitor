@@ -19,3 +19,11 @@ netai_report.xlsx
 
 # Локальные секреты/переменные окружения
 .env
+
+# Артефакты сборки PyInstaller/Inno Setup — генерируются из .spec/.iss,
+# не часть исходного кода
+build/
+dist/
+installer_output/
+*.db
+

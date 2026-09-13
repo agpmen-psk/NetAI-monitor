@@ -1,13 +1,14 @@
 """
 settings.py — единая точка чтения/записи настроек приложения.
-Все параметры хранятся в PostgreSQL (таблица app_settings), поэтому
-GUI-вкладка «Настройки» может их менять без перезапуска и без правки кода.
+Параметры хранятся в таблице app_settings — в PostgreSQL или, в офлайн-режиме
+без развёрнутой БД (см. backend.py), в локальном SQLite. SettingsManager не
+завязан на конкретный бэкенд — принимает готовый repo (duck typing: любой
+объект с get_all()/set_many()), поэтому GUI-вкладка «Настройки» работает
+одинаково в обоих случаях.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-
-from db import Database, SettingsRepository
 
 
 @dataclass
@@ -41,10 +42,11 @@ class AppSettings:
 
 
 class SettingsManager:
-    """Обёртка над SettingsRepository для удобного использования в GUI и main.py."""
+    """Обёртка над репозиторием настроек (Postgres или SQLite — см. backend.py)
+    для удобного использования в GUI и main.py."""
 
-    def __init__(self, db: Database):
-        self.repo = SettingsRepository(db)
+    def __init__(self, repo):
+        self.repo = repo
 
     def load(self) -> AppSettings:
         return AppSettings.from_dict(self.repo.get_all())

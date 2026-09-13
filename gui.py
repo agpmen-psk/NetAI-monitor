@@ -2726,15 +2726,14 @@ class Sidebar(QWidget):
 # ---------------------------------------------------------------------------
 
 class MainWindow(QMainWindow):
-    def __init__(self, db: Database, settings_manager: SettingsManager, zabbix_client, oxidized_client,
-                 analyzer, incident_rag=None, config_rag=None):
+    def __init__(self, incident_repo, config_repo, settings_manager: SettingsManager,
+                 zabbix_client, oxidized_client, analyzer, incident_rag=None, config_rag=None,
+                 offline_mode: bool = False):
         super().__init__()
         self.setWindowTitle("NetAI Monitor — интеллектуальный анализ сетевой инфраструктуры")
         self.resize(1360, 840)
         self.setStyleSheet(APP_STYLESHEET)
-
-        incident_repo = IncidentRepository(db)
-        config_repo = ConfigDiffRepository(db)
+        self.offline_mode = offline_mode
 
         central = GlowBackground()
         root = QHBoxLayout(central)
@@ -2777,7 +2776,10 @@ class MainWindow(QMainWindow):
         mode = "Синтетические данные (демо)" if settings_manager.load().use_synthetic_data else "Боевые данные"
         analyzer_mode = "Ollama (локально)" if isinstance(analyzer, OllamaAnalyzer) else "Rule-based (офлайн)"
         rag_mode = "RAG включён" if incident_rag else "RAG выключен"
-        self.statusBar().showMessage(f"режим: {mode}  |  ИИ: {analyzer_mode}  |  {rag_mode}")
+        storage_mode = "БД: SQLite офлайн (PostgreSQL недоступен)" if offline_mode else "БД: PostgreSQL"
+        self.statusBar().showMessage(
+            f"режим: {mode}  |  ИИ: {analyzer_mode}  |  {rag_mode}  |  {storage_mode}"
+        )
 
     def _on_nav_clicked(self, index: int):
         self.stack.setCurrentIndex(index)
@@ -2797,8 +2799,8 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.refresh()
 
 
-def run_app(db: Database, settings_manager: SettingsManager, zabbix_client, oxidized_client, analyzer,
-            incident_rag=None, config_rag=None):
+def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbix_client,
+            oxidized_client, analyzer, incident_rag=None, config_rag=None, offline_mode: bool = False):
     app = QApplication.instance() or QApplication([])
     # Fusion — кроссплатформенный стиль, полностью отрисовываемый через QSS.
     # Нативный стиль Windows (windowsvista) на диалогах (QMessageBox и т.п.)
@@ -2810,7 +2812,8 @@ def run_app(db: Database, settings_manager: SettingsManager, zabbix_client, oxid
     # наследуют его надёжно: Qt не всегда прокидывает QSS родительского
     # окна в отдельные top-level диалоги, и кнопки/фон остаются дефолтными.
     app.setStyleSheet(APP_STYLESHEET)
-    window = MainWindow(db, settings_manager, zabbix_client, oxidized_client, analyzer,
-                         incident_rag=incident_rag, config_rag=config_rag)
+    window = MainWindow(incident_repo, config_repo, settings_manager, zabbix_client, oxidized_client,
+                         analyzer, incident_rag=incident_rag, config_rag=config_rag,
+                         offline_mode=offline_mode)
     window.show()
     app.exec()
