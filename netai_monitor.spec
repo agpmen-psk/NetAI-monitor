@@ -22,7 +22,10 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[],
-    datas=[("assets/icon.ico", "assets")],
+    datas=[
+        ("assets/icon.ico", "assets"),
+        ("assets/fonts/*.ttf", "assets/fonts"),
+    ],
     hiddenimports=hiddenimports,
     hookspath=[],
     hooksconfig={},

@@ -22,7 +22,7 @@ from datetime import datetime, timedelta
 from PySide6.QtCore import Qt, QThread, Signal, QPointF, QRectF, QTimer
 from PySide6.QtGui import (
     QFont, QPainter, QPen, QColor, QPainterPath, QLinearGradient, QRadialGradient,
-    QBrush, QTextDocument, QIcon,
+    QBrush, QTextDocument, QIcon, QFontDatabase,
 )
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
@@ -47,23 +47,33 @@ from chat_query import build_context as build_chat_context
 # Токены дизайна
 # ---------------------------------------------------------------------------
 
-BG_TOP = "#0E1830"
-BG = "#080B14"
-SIDEBAR_BG = "#0A0D18"
-PANEL_BG = "rgba(255, 255, 255, 0.045)"
-PANEL_BORDER = "rgba(255, 255, 255, 0.08)"
-TRACK_BG = "#1A1E29"
-TEXT_PRIMARY = "#E8EBF2"
-TEXT_SECONDARY = "#8891A7"
-TEXT_MUTED = "#4E566B"
-ACCENT = "#5B8DEF"
-ACCENT_LIGHT = "#8FB3FF"
-POSITIVE = "#4ADE80"
-NEGATIVE = "#F87171"
-WARNING = "#FBBF24"
+# Палитра заземлена в диспетчерской/КИПиА-эстетике энергосетевого NOC, а не
+# в стоковом «AI SaaS dashboard» (тёмный фон + один синий акцент — это
+# буквально узнаваемый генеративный тилл). ACCENT — приглушённый циан,
+# ассоциация со следом на осциллографе/радаре, сознательно не пересекается
+# ни с фирменным индиго ИИ-чатов, ни с цветами критичности инцидентов
+# (те взяты из реальной палитры Zabbix, см. models.py, и не меняются).
+BG_TOP = "#141A1C"
+BG = "#0C1012"
+SIDEBAR_BG = "#0A0E10"
+PANEL_BG = "rgba(255, 255, 255, 0.035)"
+PANEL_BORDER = "rgba(255, 255, 255, 0.07)"
+TRACK_BG = "#1D2325"
+TEXT_PRIMARY = "#E8EAEA"
+TEXT_SECONDARY = "#8B9294"
+TEXT_MUTED = "#565C5E"
+ACCENT = "#3FB6B6"
+ACCENT_LIGHT = "#6ECFCF"
+POSITIVE = "#4FA47B"
+NEGATIVE = "#D9645A"
+WARNING = "#D6A544"
 
-FONT_DATA = "'JetBrains Mono', 'Cascadia Mono', 'Consolas', monospace"
-FONT_TEXT = "'Segoe UI', 'Inter', sans-serif"
+# IBM Plex Mono — инженерный моноширинный шрифт (данные/идентификаторы/diff);
+# PT Sans — шрифт ParaType, спроектированный для официальной русскоязычной
+# типографики (интерфейс/текст). Оба зашиты в exe (см. load_bundled_fonts),
+# рендерятся одинаково независимо от того, что установлено на компьютере.
+FONT_DATA = "'IBM Plex Mono', 'Consolas', monospace"
+FONT_TEXT = "'PT Sans', 'Segoe UI', sans-serif"
 
 APP_STYLESHEET = f"""
 QMainWindow {{ background-color: {BG}; }}
@@ -147,6 +157,21 @@ def resource_path(relative: str) -> str:
 def app_icon() -> QIcon:
     path = resource_path(os.path.join("assets", "icon.ico"))
     return QIcon(path) if os.path.exists(path) else QIcon()
+
+
+def load_bundled_fonts() -> None:
+    """Регистрирует IBM Plex Mono/PT Sans из assets/fonts — так интерфейс
+    рендерится одинаково на любом компьютере (в т.ч. на защите), а не
+    откатывается на системный шрифт, если PT Sans/Plex не установлены.
+    Если по какой-то причине файлы не найдены — QSS-стек всё равно
+    подстрахован системными шрифтами ('Segoe UI', 'Consolas')."""
+    fonts_dir = resource_path(os.path.join("assets", "fonts"))
+    if not os.path.isdir(fonts_dir):
+        return
+    for name in os.listdir(fonts_dir):
+        if name.lower().endswith(".ttf"):
+            QFontDatabase.addApplicationFont(os.path.join(fonts_dir, name))
+
 
 MESSAGE_BOX_STYLESHEET = f"""
 QMessageBox {{ background-color: #10141F; }}
@@ -321,19 +346,37 @@ def _repeat_rate(incidents: list[Incident]) -> float:
 # ---------------------------------------------------------------------------
 
 class GlowBackground(QWidget):
-    """Центральный виджет окна — рисует радиальную подсветку фона."""
+    """Центральный виджет окна — фон.
+
+    Раньше здесь было цветное радиальное свечение (тёмный фон + один яркий
+    акцент) — узнаваемый шаблон генеративных «AI-дашбордов». Заменено на
+    тихую миллиметровку: сетевые топологии и схемы черт  на сетке, а не на
+    цветном градиенте, и это единственный «фирменный» элемент фона —
+    остальное держится тихо, чтобы не спорить с данными поверх."""
+
+    GRID_STEP = 28
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setRenderHint(QPainter.Antialiasing, False)
         w, h = self.width(), self.height()
         painter.fillRect(self.rect(), QColor(BG))
-        gradient = QRadialGradient(w * 0.34, h * 0.02, w * 0.62)
-        gradient.setColorAt(0.0, QColor("#24406F"))
-        gradient.setColorAt(0.35, QColor("#152A4D"))
-        gradient.setColorAt(0.7, QColor(BG))
-        gradient.setColorAt(1.0, QColor(BG))
-        painter.fillRect(self.rect(), QBrush(gradient))
+
+        # едва заметная сетка
+        painter.setPen(QPen(QColor(255, 255, 255, 6), 1))
+        for x in range(0, w, self.GRID_STEP):
+            painter.drawLine(x, 0, x, h)
+        for y in range(0, h, self.GRID_STEP):
+            painter.drawLine(0, y, w, y)
+
+        # очень тихая виньетка сверху-слева — глубина без цветного пятна
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        top_tint = QColor(BG_TOP)
+        top_tint.setAlpha(90)
+        vignette = QRadialGradient(w * 0.15, -h * 0.1, w * 0.9)
+        vignette.setColorAt(0.0, top_tint)
+        vignette.setColorAt(1.0, QColor(0, 0, 0, 0))
+        painter.fillRect(self.rect(), QBrush(vignette))
 
 
 class Card(QFrame):
@@ -3198,6 +3241,7 @@ class MainWindow(QMainWindow):
 def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbix_client,
             oxidized_client, analyzer, incident_rag=None, config_rag=None, offline_mode: bool = False):
     app = QApplication.instance() or QApplication([])
+    load_bundled_fonts()
     # Fusion — кроссплатформенный стиль, полностью отрисовываемый через QSS.
     # Нативный стиль Windows (windowsvista) на диалогах (QMessageBox и т.п.)
     # иногда рисует кнопки своей темой поверх наших стилей — кнопка при этом
