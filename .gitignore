@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+
+.venv/
+venv/
+env/
+
+.idea/
+.vscode/
+
+*.log
+
+# Экспортированные отчёты — не часть кода проекта
+netai_report.pdf
+netai_report.xlsx
+*.pdf
+*.xlsx
+
+# Локальные секреты/переменные окружения
+.env
