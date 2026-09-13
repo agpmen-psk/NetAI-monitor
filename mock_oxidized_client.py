@@ -45,6 +45,14 @@ SYNTHETIC_DIFFS = [
         "-  no ip nat inside source static tcp 192.0.2.10 3389 interface GigabitEthernet0/0 3389\n"
         "+  ip nat inside source static tcp 192.0.2.10 3389 interface GigabitEthernet0/0 3389\n"
     )},
+    {"node": "SRV-MONITORING-DEMO-01", "diff": (
+        "--- before\n+++ after\n@@ ntp @@\n"
+        "-  ntp server 192.0.2.200\n+  no ntp server 192.0.2.200\n"
+    )},
+    {"node": "PBX-ASTERISK-DEMO-01", "diff": (
+        "--- before\n+++ after\n@@ line vty 0 4 @@\n"
+        "-  transport input ssh\n+  transport input telnet ssh\n password admin\n"
+    )},
 ]
 
 SYNTHETIC_FULL_CONFIGS = {
@@ -148,7 +156,14 @@ class MockOxidizedClient:
         ]
 
     def get_diff(self, node: str, version_a: str, version_b: str) -> ConfigDiff:
-        entry = next((d for d in SYNTHETIC_DIFFS if d["node"] == node), SYNTHETIC_DIFFS[0])
+        # Раньше при отсутствии узла в SYNTHETIC_DIFFS молча подставлялся
+        # SYNTHETIC_DIFFS[0] (diff другого устройства) — для двух демо-узлов
+        # без своей записи это приводило к анализу и сохранению чужого diff'а
+        # как будто это их собственные изменения. Честный «нет изменений»
+        # лучше, чем данные не того устройства.
+        entry = next((d for d in SYNTHETIC_DIFFS if d["node"] == node), None)
+        if entry is None:
+            return ConfigDiff(node=node, diff_text=f"--- before\n+++ after\n(нет отслеживаемых изменений для {node})\n")
         return ConfigDiff(node=node, diff_text=entry["diff"])
 
     def get_all_diffs(self) -> List[ConfigDiff]:

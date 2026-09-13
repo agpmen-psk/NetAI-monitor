@@ -56,6 +56,7 @@ class ZabbixClient(BaseZabbixClient):
         events = self.zapi.event.get(
             output="extend",
             selectHosts=["host"],
+            selectRelatedObject=["expression"],
             source=0,
             object=0,
             value=1,
@@ -67,6 +68,12 @@ class ZabbixClient(BaseZabbixClient):
         incidents = []
         for ev in events:
             host_name = ev["hosts"][0]["host"] if ev.get("hosts") else "unknown"
+            # ev["object"] — это код типа объекта фильтра event.get (для триггеров
+            # всегда "0"), а не ключ item'а — раньше сюда по ошибке попадало
+            # именно это поле, и в UI/промпте LLM для каждого инцидента
+            # показывался бессмысленный "0". selectRelatedObject возвращает
+            # выражение триггера, которое реально содержит имя хоста и ключ item'а.
+            item_key = (ev.get("relatedObject") or {}).get("expression", "")
             incidents.append(
                 Incident(
                     id=ev["eventid"],
@@ -74,7 +81,7 @@ class ZabbixClient(BaseZabbixClient):
                     problem_name=ev["name"],
                     severity=Severity(int(ev["severity"])),
                     timestamp=datetime.fromtimestamp(int(ev["clock"])),
-                    item_key=ev.get("object", ""),
+                    item_key=item_key,
                 )
             )
         return incidents
@@ -123,6 +130,14 @@ class MockZabbixClient(BaseZabbixClient):
 
     def __init__(self, seed: int | None = None):
         self._rng = random.Random(seed)
+        # Счётчик вызовов, а не просто индекс в пачке — иначе каждый повторный
+        # вызов (обычное «Обновить», автообновление) генерирует те же id
+        # 100000..100000+count-1 с НОВЫМ случайным содержимым. save_incidents
+        # при ON CONFLICT обновляет только ai_summary/ai_recommendation, но не
+        # host/problem_name — в итоге старый инцидент молча «переобувается» в
+        # анализ совершенно другой проблемы под тем же id, а индикатор
+        # непрочитанного перестаёт видеть что-либо новым (id ведь не менялись).
+        self._call_seq = 0
 
     def test_connection(self) -> bool:
         return True
@@ -130,6 +145,8 @@ class MockZabbixClient(BaseZabbixClient):
     def get_active_problems(self, count: int = 40) -> List[Incident]:
         incidents = []
         now = datetime.now()
+        base_id = 100000 + self._call_seq * count
+        self._call_seq += 1
         for i in range(count):
             host = self._rng.choice(self.HOSTS)
             template, severity, key, value = self._rng.choice(self.PROBLEM_TEMPLATES)
@@ -139,7 +156,7 @@ class MockZabbixClient(BaseZabbixClient):
 
             incidents.append(
                 Incident(
-                    id=str(100000 + i),
+                    id=str(base_id + i),
                     host=host,
                     problem_name=problem_name,
                     severity=severity,

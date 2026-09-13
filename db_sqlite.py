@@ -139,7 +139,8 @@ class SQLiteIncidentRepository:
                     ON CONFLICT(id) DO UPDATE SET
                         ai_summary = excluded.ai_summary,
                         ai_recommendation = excluded.ai_recommendation,
-                        saved_at = excluded.saved_at
+                        saved_at = CASE WHEN incidents.ai_verified
+                            THEN incidents.saved_at ELSE excluded.saved_at END
                     """,
                     (
                         inc.id, inc.host, inc.problem_name, inc.severity.value,

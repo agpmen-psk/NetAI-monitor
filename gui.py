@@ -34,7 +34,7 @@ from PySide6.QtWidgets import (
 
 from models import Incident, Severity
 from settings import AppSettings, SettingsManager
-from db import Database, IncidentRepository, ConfigDiffRepository
+from db import IncidentRepository, ConfigDiffRepository
 from llm_client import OllamaAnalyzer
 from zabbix_client import MockZabbixClient, ZabbixClient
 from mock_oxidized_client import MockOxidizedClient
@@ -292,6 +292,17 @@ def _format_duration(seconds: float) -> str:
     if hours < 24:
         return f"{hours:.1f} ч"
     return f"{hours / 24:.1f} дн"
+
+
+def _clear_layout(layout) -> None:
+    """Рекурсивно снимает все виджеты/вложенные layout'ы перед перерисовкой —
+    общая реализация, раньше была продублирована в DashboardTab и AnalyticsTab."""
+    while layout.count():
+        item = layout.takeAt(0)
+        if item.widget():
+            item.widget().deleteLater()
+        elif item.layout():
+            _clear_layout(item.layout())
 
 
 def _repeat_rate(incidents: list[Incident]) -> float:
@@ -1019,21 +1030,13 @@ class DashboardTab(QScrollArea):
 
         self.refresh()
 
-    def _clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            elif item.layout():
-                self._clear_layout(item.layout())
-
     def refresh(self):
         incidents = self.incident_repo.get_history(limit=200)
         configs = self.config_repo.get_history(limit=100)
 
-        self._clear_layout(self.stats_row)
-        self._clear_layout(self.pipeline_slot)
-        self._clear_layout(self.bottom_row)
+        _clear_layout(self.stats_row)
+        _clear_layout(self.pipeline_slot)
+        _clear_layout(self.bottom_row)
 
         total = len(incidents)
         critical_24h = sum(
@@ -1321,13 +1324,18 @@ class AlertsTab(QWidget):
         self._mark_unread(incidents)
         self.incident_added.emit()
 
+    # Заметно строже общего RAG-порога релевантности (см. rag.py max_distance=0.4
+    # по умолчанию для контекста промпта) — для «это дубликат» нужна почти
+    # точная идентичность текста, а не просто тематическая похожесть.
+    DUPLICATE_MAX_DISTANCE = 0.08
+
     def _check_duplicate(self, inc: Incident) -> str | None:
         """Если в истории уже есть почти идентичный случай на том же хосте —
         предупреждаем оператора, что это может быть повтор, а не новый инцидент."""
         if self.rag is None:
             return None
         try:
-            similar = self.rag.find_similar(inc.problem_name, limit=3, max_distance=0.08)
+            similar = self.rag.find_similar(inc.problem_name, limit=3, max_distance=self.DUPLICATE_MAX_DISTANCE)
         except Exception:
             return None
         for s in similar:
@@ -1616,19 +1624,23 @@ class ConfigsTab(QWidget):
             self.list_widget.setItemWidget(item, widget)
 
     def run_diff_check(self):
+        if self._live_workers:
+            return  # diff/аудит/внешняя отправка уже выполняются — не запускаем поверх
         selected = self.device_selector.currentText()
         self.diff_btn.setEnabled(False)
         self.diff_btn.setText("Анализирую...")
+        self.audit_btn.setEnabled(False)
 
         if selected == self.ALL_DEVICES:
             task_fn = self._task_diff_all
         else:
             task_fn = lambda: self._task_diff_single(selected)
 
-        self.worker = ConfigTaskWorker(task_fn)
-        self.worker.finished.connect(lambda results: self._on_finished(results, self.diff_btn, "Проверить diff"))
-        self.worker.error.connect(lambda msg: self._on_error(msg, self.diff_btn, "Проверить diff"))
-        self.worker.start()
+        worker = ConfigTaskWorker(task_fn)
+        worker.finished.connect(lambda results: self._on_finished(results, worker))
+        worker.error.connect(lambda msg: self._on_error(msg, worker))
+        self._live_workers.append(worker)
+        worker.start()
 
     def run_full_audit(self):
         selected = self.device_selector.currentText()
@@ -1638,14 +1650,18 @@ class ConfigsTab(QWidget):
                 "Для полного аудита выберите конкретное устройство, не «Все устройства».",
             )
             return
+        if self._live_workers:
+            return
 
         self.audit_btn.setEnabled(False)
         self.audit_btn.setText("Анализирую...")
+        self.diff_btn.setEnabled(False)
 
-        self.worker = ConfigTaskWorker(lambda: self._task_full_audit(selected))
-        self.worker.finished.connect(lambda results: self._on_finished(results, self.audit_btn, "Полный аудит конфига"))
-        self.worker.error.connect(lambda msg: self._on_error(msg, self.audit_btn, "Полный аудит конфига"))
-        self.worker.start()
+        worker = ConfigTaskWorker(lambda: self._task_full_audit(selected))
+        worker.finished.connect(lambda results: self._on_finished(results, worker))
+        worker.error.connect(lambda msg: self._on_error(msg, worker))
+        self._live_workers.append(worker)
+        worker.start()
 
     def _task_diff_all(self) -> list:
         diffs = self.oxidized_client.get_all_diffs()
@@ -1680,17 +1696,25 @@ class ConfigsTab(QWidget):
                 except Exception:
                     pass
 
-    def _on_finished(self, results, btn, btn_text):
+    def _reset_bulk_buttons(self):
+        self.diff_btn.setEnabled(True)
+        self.diff_btn.setText("Проверить diff")
+        self.audit_btn.setEnabled(True)
+        self.audit_btn.setText("Полный аудит конфига")
+
+    def _on_finished(self, results, worker):
+        if worker in self._live_workers:
+            self._live_workers.remove(worker)
         self._save_results(results)
         self._load_history()
-        btn.setEnabled(True)
-        btn.setText(btn_text)
+        self._reset_bulk_buttons()
         self.config_added.emit()
 
-    def _on_error(self, message, btn, btn_text):
+    def _on_error(self, message, worker):
+        if worker in self._live_workers:
+            self._live_workers.remove(worker)
         self.detail_view.setPlainText(f"Ошибка: {message}")
-        btn.setEnabled(True)
-        btn.setText(btn_text)
+        self._reset_bulk_buttons()
 
     def _task_from_external(self, node: str, review_type: str, text: str) -> list:
         if review_type == "full_audit":
@@ -2109,13 +2133,16 @@ class SyntheticDataTab(QWidget):
     """Демо-режим, очистка БД и переиндексация RAG-эмбеддингов."""
 
     def __init__(self, settings_manager: SettingsManager, incident_repo: IncidentRepository,
-                 config_repo: ConfigDiffRepository, incident_rag=None, config_rag=None):
+                 config_repo: ConfigDiffRepository, incident_rag=None, config_rag=None,
+                 offline_mode: bool = False):
         super().__init__()
         self.settings_manager = settings_manager
         self.incident_repo = incident_repo
         self.config_repo = config_repo
         self.incident_rag = incident_rag
         self.config_rag = config_rag
+        self.offline_mode = offline_mode
+        self._reindex_workers: list[ComparisonWorker] = []
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
@@ -2162,10 +2189,10 @@ class SyntheticDataTab(QWidget):
         rag_desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; border: none; background: transparent;")
         rag_layout.addWidget(rag_desc)
 
-        reindex_btn = QPushButton("Переиндексировать историю")
-        reindex_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
-        reindex_btn.clicked.connect(self._reindex)
-        rag_layout.addWidget(reindex_btn, alignment=Qt.AlignLeft)
+        self.reindex_btn = QPushButton("Переиндексировать историю")
+        self.reindex_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        self.reindex_btn.clicked.connect(self._reindex)
+        rag_layout.addWidget(self.reindex_btn, alignment=Qt.AlignLeft)
 
         root.addWidget(rag_card)
 
@@ -2207,19 +2234,58 @@ class SyntheticDataTab(QWidget):
 
     def _reindex(self):
         if self.incident_rag is None and self.config_rag is None:
-            warn_box(
-                self, "RAG недоступен",
-                "Модель nomic-embed-text не найдена в Ollama. Выполните: ollama pull nomic-embed-text",
-            )
+            if self.offline_mode:
+                # Раньше здесь всегда советовали "ollama pull nomic-embed-text",
+                # даже когда реальная причина — офлайн-режим на SQLite (нет
+                # pgvector вообще). Никакая модель эту причину не устранит.
+                warn_box(
+                    self, "RAG недоступен",
+                    "Приложение сейчас работает в офлайн-режиме на локальном SQLite "
+                    "(PostgreSQL недоступен) — RAG требует pgvector и доступен только "
+                    "с PostgreSQL. Настройте подключение на вкладке Настройки → "
+                    "PostgreSQL и перезапустите приложение.",
+                )
+            else:
+                warn_box(
+                    self, "RAG недоступен",
+                    "Модель nomic-embed-text не найдена в Ollama. Выполните: ollama pull nomic-embed-text",
+                )
             return
 
-        incidents_indexed = self.incident_rag.reindex_missing(self.incident_repo) if self.incident_rag else 0
-        configs_indexed = self.config_rag.reindex_missing(self.config_repo) if self.config_rag else 0
+        # Переиндексация — это потенциально сотни последовательных HTTP-вызовов
+        # к Ollama плюс запросы к БД; раньше выполнялась прямо в обработчике
+        # клика на GUI-потоке и полностью замораживала интерфейс на время
+        # всей операции. Теперь — в фоне, кнопка блокируется до завершения.
+        self.reindex_btn.setEnabled(False)
+        self.reindex_btn.setText("Переиндексирую...")
 
+        def task():
+            incidents_indexed = self.incident_rag.reindex_missing(self.incident_repo) if self.incident_rag else 0
+            configs_indexed = self.config_rag.reindex_missing(self.config_repo) if self.config_rag else 0
+            return {"incidents": incidents_indexed, "configs": configs_indexed}
+
+        worker = ComparisonWorker(task)
+        worker.finished.connect(lambda result: self._on_reindex_finished(worker, result))
+        worker.error.connect(lambda msg: self._on_reindex_error(worker, msg))
+        self._reindex_workers.append(worker)
+        worker.start()
+
+    def _on_reindex_finished(self, worker, result: dict):
+        if worker in self._reindex_workers:
+            self._reindex_workers.remove(worker)
+        self.reindex_btn.setEnabled(True)
+        self.reindex_btn.setText("Переиндексировать историю")
         info_box(
             self, "Переиндексация завершена",
-            f"Проиндексировано: {incidents_indexed} инцидентов, {configs_indexed} проверок конфигураций.",
+            f"Проиндексировано: {result['incidents']} инцидентов, {result['configs']} проверок конфигураций.",
         )
+
+    def _on_reindex_error(self, worker, message: str):
+        if worker in self._reindex_workers:
+            self._reindex_workers.remove(worker)
+        self.reindex_btn.setEnabled(True)
+        self.reindex_btn.setText("Переиндексировать историю")
+        warn_box(self, "Ошибка переиндексации", message)
 
     def _clear_database(self):
         confirmed = confirm_box(
@@ -2532,6 +2598,7 @@ class AnalyticsTab(QScrollArea):
         self.config_repo = config_repo
         self._incidents_cache: list[Incident] = []
         self._configs_cache: list[dict] = []
+        self._true_total_incidents = 0
 
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -2580,23 +2647,21 @@ class AnalyticsTab(QScrollArea):
 
         self.refresh()
 
-    def _clear_layout(self, layout):
-        while layout.count():
-            item = layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-            elif item.layout():
-                self._clear_layout(item.layout())
-
     def refresh(self):
-        incidents = self.incident_repo.get_history(limit=1000)
-        configs = self.config_repo.get_history(limit=1000)
+        # limit намеренно с большим запасом (не «1000 = вся история») —
+        # get_verification_stats()/get_stats_by_host() ниже всё равно берут
+        # истинные агрегаты прямым COUNT()/GROUP BY по всей таблице, а не по
+        # этому списку; см. _build_report_html — экспорт честно предупредит,
+        # если реальных строк в БД больше, чем попало в кэш.
+        incidents = self.incident_repo.get_history(limit=20000)
+        configs = self.config_repo.get_history(limit=20000)
         stats = self.incident_repo.get_verification_stats()
         self._incidents_cache = incidents
         self._configs_cache = configs
+        self._true_total_incidents = stats["total"]
 
-        self._clear_layout(self.stats_row)
-        self._clear_layout(self.bottom_row)
+        _clear_layout(self.stats_row)
+        _clear_layout(self.bottom_row)
 
         total = stats["total"]
         verified = stats["verified_count"]
@@ -2664,9 +2729,16 @@ class AnalyticsTab(QScrollArea):
             f"<td>{c.get('resolution') or c.get('ai_recommendation') or ''}</td></tr>"
             for c in self._configs_cache
         )
+        truncation_note = ""
+        if self._true_total_incidents > len(self._incidents_cache):
+            truncation_note = (
+                f"<p><b>Внимание:</b> в базе {self._true_total_incidents} инцидентов, "
+                f"в отчёт попали последние {len(self._incidents_cache)}.</p>"
+            )
         return f"""
         <h2>NetAI Monitor — отчёт по инцидентам и конфигурациям</h2>
         <p>Сформирован: {datetime.now().strftime('%d.%m.%Y %H:%M')}</p>
+        {truncation_note}
         <h3>Инциденты ({len(self._incidents_cache)})</h3>
         <table border="1" cellspacing="0" cellpadding="4" width="100%">
         <tr><th>Время</th><th>Хост</th><th>Проблема</th><th>Критичность</th>
@@ -2726,7 +2798,13 @@ class AnalyticsTab(QScrollArea):
             ])
 
         wb.save(path)
-        info_box(self, "Экспорт завершён", f"Отчёт сохранён: {path}")
+        note = ""
+        if self._true_total_incidents > len(self._incidents_cache):
+            note = (
+                f"\n\nВнимание: в базе {self._true_total_incidents} инцидентов, "
+                f"в файл попали последние {len(self._incidents_cache)}."
+            )
+        info_box(self, "Экспорт завершён", f"Отчёт сохранён: {path}{note}")
 
 
 # ---------------------------------------------------------------------------
@@ -3074,7 +3152,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.configs_tab)
         self.stack.addWidget(SettingsTab(settings_manager, offline_mode=offline_mode))
         self.stack.addWidget(SyntheticDataTab(settings_manager, incident_repo, config_repo,
-                                               incident_rag=incident_rag, config_rag=config_rag))
+                                               incident_rag=incident_rag, config_rag=config_rag,
+                                               offline_mode=offline_mode))
         self.stack.addWidget(self.generator_tab)
         self.analytics_tab = AnalyticsTab(incident_repo, config_repo)
         self.stack.addWidget(self.analytics_tab)

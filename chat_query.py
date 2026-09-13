@@ -41,8 +41,12 @@ def build_context(question: str, incident_repo, config_repo) -> str:
     отфильтрованные по хосту/периоду записи. Именно этот текст уходит
     в промпт LLM как единственный источник фактов (модели явно
     запрещается выдумывать то, чего здесь нет)."""
-    incidents = incident_repo.get_history(limit=1000)
-    configs = config_repo.get_history(limit=500)
+    # limit с большим запасом (не претендует быть "вся история" как факт) —
+    # для точных заголовочных чисел ниже используем настоящие агрегаты
+    # репозитория (COUNT()/GROUP BY по всей таблице), а не длину этого списка,
+    # так что даже если он будет обрезан, сводка всё равно останется верной.
+    incidents = incident_repo.get_history(limit=5000)
+    configs = config_repo.get_history(limit=5000)
 
     hosts = sorted({i.host for i in incidents} | {c.get("node", "") for c in configs if c.get("node")})
     target_host = _find_host(question, hosts)
@@ -60,9 +64,10 @@ def build_context(question: str, incident_repo, config_repo) -> str:
     if target_host:
         filtered_configs = [c for c in filtered_configs if c.get("node") == target_host]
 
-    total = len(incidents)
+    verification_stats = incident_repo.get_verification_stats()
+    total = verification_stats["total"]
     critical = sum(1 for i in incidents if i.severity in (Severity.HIGH, Severity.DISASTER))
-    top_hosts = Counter(i.host for i in incidents).most_common(3)
+    top_hosts = sorted(incident_repo.get_stats_by_host().items(), key=lambda kv: kv[1], reverse=True)[:3]
     risk_counts = Counter((c.get("ai_risk_level") or "UNKNOWN").upper() for c in configs)
 
     lines = [

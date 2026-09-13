@@ -101,19 +101,29 @@ def _correlate_incidents(incidents: List[Incident]) -> List[List[Incident]]:
 
 
 def _build_incident_prompt(incidents: List[Incident], rag_context: str = "") -> str:
-    index_map = {id(inc): i + 1 for i, inc in enumerate(incidents)}
+    # Печатаем строго в исходном порядке incidents (номер строки == номер в
+    # index_map модели) — раньше группировка переставляла проблемы в тексте
+    # промпта (по хосту), из-за чего напечатанный номер расходился с позицией
+    # в списке; модель, нумерующая свои ответные блоки подряд вместо того,
+    # чтобы скопировать напечатанный номер, могла приписать анализ не тому
+    # инциденту (только bounds-check в _apply_parsed_response, без сверки
+    # содержимого). Теперь корреляция подаётся как пометка у каждой строки,
+    # а не переупорядочиванием — порядок и нумерация гарантированно совпадают.
     groups = _correlate_incidents(incidents)
-
-    lines = []
+    group_note = {}
     for group in groups:
         if len(group) > 1:
-            lines.append(
-                f"— Группа вероятно связанных проблем на {group[0].host} "
-                f"({len(group)} подряд в пределах {CORRELATION_WINDOW_MINUTES} мин — "
-                f"возможно, это один и тот же первопричинный сбой, а не {len(group)} разных):"
-            )
-        for inc in group:
-            lines.append(f"{index_map[id(inc)]}. {inc.to_prompt_line()}")
+            for inc in group:
+                group_note[id(inc)] = (
+                    f" [вероятно связано ещё с {len(group) - 1} проблемами на {group[0].host} "
+                    f"в пределах {CORRELATION_WINDOW_MINUTES} мин — возможно, один и тот же "
+                    f"первопричинный сбой]"
+                )
+
+    lines = [
+        f"{i + 1}. {inc.to_prompt_line()}{group_note.get(id(inc), '')}"
+        for i, inc in enumerate(incidents)
+    ]
     incidents_text = "\n".join(lines)
 
     return (
@@ -158,10 +168,21 @@ def _apply_parsed_response(incidents: List[Incident], text: str) -> None:
             parsed_any = True
 
     if not parsed_any and clean_text.strip():
+        # Модель не вернула ни одного узнаваемого блока для всей пачки —
+        # показываем сырой ответ целиком, это лучше пустоты.
         for inc in incidents:
             if not inc.ai_analyzed:
                 inc.ai_summary = "Не удалось разобрать формат ответа модели:"
                 inc.ai_recommendation = clean_text.strip()[:1500]
+                inc.ai_analyzed = True
+    elif parsed_any:
+        # Часть пачки распарсилась, но не вся (модель обрезала/пропустила
+        # часть пунктов) — раньше такие инциденты молча оставались без
+        # анализа (ai_analyzed=False) без единого сообщения об ошибке.
+        for inc in incidents:
+            if not inc.ai_analyzed:
+                inc.ai_summary = "Модель не вернула анализ для этого пункта в общей пачке."
+                inc.ai_recommendation = "Нажмите «Обновить и проанализировать» ещё раз — этот инцидент попадёт в новую пачку."
                 inc.ai_analyzed = True
 
 
@@ -215,10 +236,15 @@ class OllamaAnalyzer(BaseAnalyzer):
             try:
                 self._call_incidents(_build_incident_prompt(batch, rag_context), INCIDENT_SYSTEM_PROMPT, batch)
             except Exception as e:
+                # Раньше сюда писался сырой текст исключения вместо анализа —
+                # оператор видел Python-ошибку в поле «рекомендация». Модель
+                # была доступна на старте (is_available), но могла упасть
+                # позже (перезапуск Ollama, удалили модель, кончилось место) —
+                # откатываемся на RuleBasedAnalyzer для этой пачки вместо
+                # того, чтобы требовать перезапуск всего приложения.
+                RuleBasedAnalyzer().analyze(batch)
                 for inc in batch:
-                    inc.ai_summary = f"Ошибка анализа: {e}"
-                    inc.ai_recommendation = "Проверьте, что Ollama запущена и доступна."
-                    inc.ai_analyzed = False
+                    inc.ai_recommendation = f"[Ollama недоступна: {e}] {inc.ai_recommendation}"
         return incidents
 
     def _call_incidents(self, prompt: str, system: str, batch: List[Incident]) -> None:

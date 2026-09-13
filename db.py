@@ -140,7 +140,11 @@ class IncidentRepository:
         """ai_verified и resolution намеренно отсутствуют в списке колонок INSERT —
         Postgres обновляет по ON CONFLICT только перечисленные поля, так что
         повторный анализ того же id никогда не заденет решение, вписанное
-        инженером вручную (см. update_correction)."""
+        инженером вручную (см. update_correction). saved_at для уже
+        проверенных записей тоже не трогаем (CASE ниже) — иначе повторное
+        сохранение того же id (повторный опрос, коллизия синтетических id)
+        сдвигало бы saved_at на текущий момент и портило расчёт среднего
+        времени до проверки в get_verification_stats."""
         with self.db._connect() as conn:
             with conn.cursor() as cur:
                 for inc in incidents:
@@ -153,7 +157,8 @@ class IncidentRepository:
                         ON CONFLICT (id) DO UPDATE SET
                             ai_summary = EXCLUDED.ai_summary,
                             ai_recommendation = EXCLUDED.ai_recommendation,
-                            saved_at = EXCLUDED.saved_at
+                            saved_at = CASE WHEN incidents.ai_verified
+                                THEN incidents.saved_at ELSE EXCLUDED.saved_at END
                         """,
                         (
                             inc.id, inc.host, inc.problem_name, inc.severity.value,
