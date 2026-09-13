@@ -38,6 +38,7 @@ from zabbix_client import MockZabbixClient, ZabbixClient
 from mock_oxidized_client import MockOxidizedClient
 from oxidized_client import OxidizedClient
 from rag import EmbeddingClient
+from local_config import load_postgres_config, save_postgres_config, build_dsn
 
 # ---------------------------------------------------------------------------
 # Токены дизайна
@@ -1800,13 +1801,73 @@ class ConfigsTab(QWidget):
 # ---------------------------------------------------------------------------
 
 class SettingsTab(QWidget):
-    def __init__(self, settings_manager: SettingsManager, on_saved=None):
+    def __init__(self, settings_manager: SettingsManager, on_saved=None, offline_mode: bool = False):
         super().__init__()
         self.settings_manager = settings_manager
         self.on_saved = on_saved
+        self.offline_mode = offline_mode
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
+
+        # --- PostgreSQL: подключение читается ДО выбора бэкенда (local_config.py),
+        # поэтому хранится отдельно от остальных настроек (app_settings живёт
+        # уже внутри выбранной БД — курица и яйцо).
+        pg_card = Card(radius=18, accent_left=(TEXT_MUTED if self.offline_mode else POSITIVE))
+        pg_layout = QVBoxLayout(pg_card)
+        pg_layout.setContentsMargins(24, 20, 24, 20)
+        pg_layout.setSpacing(10)
+
+        pg_header = QHBoxLayout()
+        pg_header.addWidget(_label("PostgreSQL", size=14, weight=700))
+        pg_header.addStretch()
+        current_storage = "сейчас: SQLite (офлайн)" if self.offline_mode else "сейчас: PostgreSQL"
+        pg_header.addWidget(_label(
+            current_storage, size=11, weight=700,
+            color=TEXT_MUTED if self.offline_mode else POSITIVE,
+        ))
+        pg_layout.addLayout(pg_header)
+
+        pg_layout.addWidget(_label(
+            "Если PostgreSQL недоступен при запуске, приложение автоматически "
+            "работает на локальном SQLite (без RAG). Укажите параметры ниже и "
+            "сохраните, чтобы перейти на PostgreSQL — потребуется перезапуск.",
+            size=11, color=TEXT_MUTED,
+        ))
+
+        pg_config = load_postgres_config()
+        pg_form = QFormLayout()
+        pg_form.setSpacing(12)
+        self.pg_host = QLineEdit(pg_config["host"])
+        self.pg_port = QLineEdit(pg_config["port"])
+        self.pg_dbname = QLineEdit(pg_config["dbname"])
+        self.pg_user = QLineEdit(pg_config["user"])
+        self.pg_password = QLineEdit(pg_config["password"])
+        self.pg_password.setEchoMode(QLineEdit.Password)
+        for label, widget in [
+            ("Хост", self.pg_host), ("Порт", self.pg_port), ("База данных", self.pg_dbname),
+            ("Пользователь", self.pg_user), ("Пароль", self.pg_password),
+        ]:
+            pg_form.addRow(_label(label, size=12, color=TEXT_SECONDARY), widget)
+        pg_layout.addLayout(pg_form)
+
+        pg_action_row = QHBoxLayout()
+        pg_check_btn = QPushButton("Проверить подключение")
+        pg_check_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        pg_check_btn.clicked.connect(self._check_postgres_now)
+        pg_action_row.addWidget(pg_check_btn)
+
+        pg_save_btn = QPushButton("Сохранить и использовать PostgreSQL")
+        pg_save_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
+        pg_save_btn.clicked.connect(self._save_postgres_config)
+        pg_action_row.addWidget(pg_save_btn)
+        pg_action_row.addStretch()
+        pg_layout.addLayout(pg_action_row)
+
+        self.pg_status_label = _label("", size=11, color=TEXT_MUTED)
+        pg_layout.addWidget(self.pg_status_label)
+
+        root.addWidget(pg_card)
 
         card = Card(radius=18)
         form_layout = QVBoxLayout(card)
@@ -1932,6 +1993,49 @@ class SettingsTab(QWidget):
             return ok, ("модель доступна" if ok else "не отвечает или модель не скачана")
         except Exception as e:
             return False, str(e)[:150]
+
+    def _current_pg_config(self) -> dict:
+        return {
+            "host": self.pg_host.text().strip() or "localhost",
+            "port": self.pg_port.text().strip() or "5432",
+            "dbname": self.pg_dbname.text().strip() or "netai_monitor",
+            "user": self.pg_user.text().strip() or "postgres",
+            "password": self.pg_password.text(),
+        }
+
+    def _check_postgres(self):
+        try:
+            import psycopg2
+            conn = psycopg2.connect(build_dsn(self._current_pg_config()), connect_timeout=5)
+            conn.close()
+            return True, "подключение успешно"
+        except Exception as e:
+            return False, str(e)[:150]
+
+    def _check_postgres_now(self):
+        self.pg_status_label.setText("проверяю...")
+        self.pg_status_label.setStyleSheet(f"color: {WARNING}; font-size: 11px; border: none; background: transparent;")
+        worker = ConnectionCheckWorker(self._check_postgres)
+        worker.finished.connect(lambda ok, msg: self._on_postgres_check_finished(worker, ok, msg))
+        self._check_workers.append(worker)
+        worker.start()
+
+    def _on_postgres_check_finished(self, worker, ok: bool, message: str) -> None:
+        if worker in self._check_workers:
+            self._check_workers.remove(worker)
+        self.pg_status_label.setText(("✓ " if ok else "✗ ") + message)
+        self.pg_status_label.setStyleSheet(
+            f"color: {POSITIVE if ok else NEGATIVE}; font-size: 11px; border: none; background: transparent;"
+        )
+
+    def _save_postgres_config(self):
+        save_postgres_config(self._current_pg_config())
+        info_box(
+            self, "PostgreSQL",
+            "Параметры подключения сохранены. Перезапустите приложение — оно "
+            "попробует подключиться к PostgreSQL и, если получится, перейдёт "
+            "с локального SQLite на него автоматически.",
+        )
 
     def _save(self):
         settings = AppSettings(
@@ -2757,7 +2861,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.dashboard_tab)
         self.stack.addWidget(self.alerts_tab)
         self.stack.addWidget(self.configs_tab)
-        self.stack.addWidget(SettingsTab(settings_manager))
+        self.stack.addWidget(SettingsTab(settings_manager, offline_mode=offline_mode))
         self.stack.addWidget(SyntheticDataTab(settings_manager, incident_repo, config_repo,
                                                incident_rag=incident_rag, config_rag=config_rag))
         self.stack.addWidget(self.generator_tab)

@@ -1,16 +1,27 @@
 """
 backend.py — выбор хранилища при запуске приложения.
 
-Пробует подключиться к PostgreSQL (боевой режим, с pgvector/RAG). Если это
-не удаётся — сеть недоступна, сервер не запущен, компьютер комиссии на
-защите без развёрнутой инфраструктуры — автоматически откатывается на
-локальный SQLite-файл в %APPDATA%. В офлайн-режиме RAG отключается (нет
-pgvector), но сама программа, синтетические данные, Zabbix/Oxidized-моки
-и Ollama-анализ (если Ollama установлена) работают как обычно.
+Пробует подключиться к PostgreSQL (боевой режим, с pgvector/RAG), используя
+параметры из local_config.py (их правит вкладка «Настройки» → «PostgreSQL»).
+Если подключиться не удаётся — сеть недоступна, сервер не запущен, компьютер
+комиссии на защите без развёрнутой инфраструктуры — автоматически
+откатывается на локальный SQLite-файл в %APPDATA%. В офлайн-режиме RAG
+отключается (нет pgvector), но сама программа, синтетические данные,
+Zabbix/Oxidized-моки и Ollama-анализ (если Ollama установлена) работают
+как обычно.
 """
 from __future__ import annotations
 
+import os
 from typing import Tuple
+
+from local_config import load_postgres_config, build_dsn
+
+
+def _resolve_dsn() -> str:
+    # NETAI_DB_DSN — явный оверрайд для CI/скриптов/тех, кто предпочитает
+    # переменные окружения; без неё используется то, что сохранено через GUI.
+    return os.environ.get("NETAI_DB_DSN") or build_dsn(load_postgres_config())
 
 
 def create_backend() -> Tuple[object, object, object, object, bool]:
@@ -18,7 +29,7 @@ def create_backend() -> Tuple[object, object, object, object, bool]:
     try:
         from db import Database, IncidentRepository, ConfigDiffRepository, SettingsRepository
 
-        db = Database()
+        db = Database(dsn=_resolve_dsn())
         incident_repo = IncidentRepository(db)
         config_repo = ConfigDiffRepository(db)
         settings_repo = SettingsRepository(db)
