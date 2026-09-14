@@ -29,12 +29,23 @@ def main():
         zabbix_client = MockZabbixClient(seed=42)
         oxidized_client = MockOxidizedClient(seed=42)
     else:
-        zabbix_client = ZabbixClient(
-            url=settings.zabbix_url,
-            user=settings.zabbix_user,
-            password=settings.zabbix_password,
-        )
-        oxidized_client = OxidizedClient(base_url=settings.oxidized_url)
+        # ZabbixClient/OxidizedClient сами не ходят в сеть в конструкторе
+        # (подключение отложено до первого запроса) — try/except здесь лишь
+        # подстраховка на случай непредвиденной ошибки конфигурации (например,
+        # некорректный URL), чтобы недоступность оборудования или опечатка в
+        # настройках никогда не роняли приложение ещё до появления окна.
+        try:
+            zabbix_client = ZabbixClient(
+                url=settings.zabbix_url,
+                user=settings.zabbix_user,
+                password=settings.zabbix_password,
+            )
+        except Exception:
+            zabbix_client = MockZabbixClient(seed=42)
+        try:
+            oxidized_client = OxidizedClient(base_url=settings.oxidized_url)
+        except Exception:
+            oxidized_client = MockOxidizedClient(seed=42)
 
     analyzer = get_analyzer(settings.ollama_host, settings.ollama_model)
 

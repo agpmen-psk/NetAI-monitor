@@ -29,19 +29,39 @@ class ZabbixClient(BaseZabbixClient):
     """
     Боевой клиент к Zabbix API через pyzabbix.
     Установка: pip install pyzabbix
+
+    Подключение (event.get) выполняется лениво — конструктор НЕ ходит в сеть,
+    только сохраняет параметры. Иначе недоступный Zabbix (таймаут, неверный
+    хост/порт) валит всё приложение ещё до появления окна: main.py создаёт
+    клиент синхронно, в основном потоке, до старта Qt-луп. С таймаутом и
+    отложенным login() ошибка сети превращается в понятное исключение,
+    которое ловит вызывающий код (GUI-воркеры уже оборачивают все такие
+    вызовы в try/except и показывают её пользователю, не роняя программу).
     """
 
-    def __init__(self, url: str, user: str, password: str):
+    def __init__(self, url: str, user: str, password: str, timeout: float = 5.0):
+        self.url = url
+        self.user = user
+        self.password = password
+        self.timeout = timeout
+        self.zapi = None
+
+    def _ensure_login(self):
+        if self.zapi is not None:
+            return
         from pyzabbix import ZabbixAPI
 
-        self.zapi = ZabbixAPI(url)
-        self.zapi.login(user, password)
+        zapi = ZabbixAPI(self.url, timeout=self.timeout)
+        zapi.login(self.user, self.password)
+        self.zapi = zapi
 
     def test_connection(self) -> bool:
         try:
+            self._ensure_login()
             self.zapi.apiinfo.version()
             return True
         except Exception:
+            self.zapi = None
             return False
 
     def get_active_problems(self, limit: int = 10) -> List[Incident]:
@@ -51,20 +71,30 @@ class ZabbixClient(BaseZabbixClient):
         source=0/object=0/value=1 — только активные триггерные проблемы.
         limit ограничивает нагрузку на PHP-сервер Zabbix и объём для LLM.
         """
+        try:
+            self._ensure_login()
+        except Exception as e:
+            raise ConnectionError(f"Zabbix недоступен: {e}") from e
+
         time_from = int((datetime.now() - timedelta(days=7)).timestamp())
 
-        events = self.zapi.event.get(
-            output="extend",
-            selectHosts=["host"],
-            selectRelatedObject=["expression"],
-            source=0,
-            object=0,
-            value=1,
-            time_from=time_from,
-            sortfield="clock",
-            sortorder="DESC",
-            limit=limit,
-        )
+        try:
+            events = self.zapi.event.get(
+                output="extend",
+                selectHosts=["host"],
+                selectRelatedObject=["expression"],
+                source=0,
+                object=0,
+                value=1,
+                time_from=time_from,
+                sortfield="clock",
+                sortorder="DESC",
+                limit=limit,
+            )
+        except Exception as e:
+            self.zapi = None
+            raise ConnectionError(f"Zabbix недоступен: {e}") from e
+
         incidents = []
         for ev in events:
             host_name = ev["hosts"][0]["host"] if ev.get("hosts") else "unknown"
