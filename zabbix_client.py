@@ -160,40 +160,52 @@ class MockZabbixClient(BaseZabbixClient):
 
     def __init__(self, seed: int | None = None):
         self._rng = random.Random(seed)
-        # Счётчик вызовов, а не просто индекс в пачке — иначе каждый повторный
-        # вызов (обычное «Обновить», автообновление) генерирует те же id
-        # 100000..100000+count-1 с НОВЫМ случайным содержимым. save_incidents
-        # при ON CONFLICT обновляет только ai_summary/ai_recommendation, но не
-        # host/problem_name — в итоге старый инцидент молча «переобувается» в
-        # анализ совершенно другой проблемы под тем же id, а индикатор
-        # непрочитанного перестаёт видеть что-либо новым (id ведь не менялись).
-        self._call_seq = 0
+        # Пул "сейчас активных" проблем, персистентный между вызовами —
+        # ключ для демонстрации реального жизненного цикла алерта (см.
+        # AlertsTab: реальное время + вкладка «Закрытые»). Раньше каждый
+        # вызов пересобирал ПОЛНОСТЬЮ новый случайный список с новыми id
+        # (через _call_seq) — идея была просто не путать одинаковые id между
+        # вызовами, но побочный эффект: "закрытие" алерта было неотличимо от
+        # того, что это просто новый случайный набор — id никогда не
+        # пропадали и не появлялись повторно, только рождались новые. Теперь
+        # пул реально живёт между опросами: часть проблем закрывается
+        # (пропадает из активных), часть появляется — как в настоящем Zabbix.
+        self._active: dict[str, Incident] = {}
+        self._next_id = 100000
 
     def test_connection(self) -> bool:
         return True
 
-    def get_active_problems(self, count: int = 40) -> List[Incident]:
-        incidents = []
-        now = datetime.now()
-        base_id = 100000 + self._call_seq * count
-        self._call_seq += 1
-        for i in range(count):
-            host = self._rng.choice(self.HOSTS)
-            template, severity, key, value = self._rng.choice(self.PROBLEM_TEMPLATES)
-            iface = self._rng.choice(self.IFACES)
-            problem_name = template.format(host=host, iface=iface)
-            minutes_ago = self._rng.randint(1, 1440)
+    def _spawn(self) -> Incident:
+        host = self._rng.choice(self.HOSTS)
+        template, severity, key, value = self._rng.choice(self.PROBLEM_TEMPLATES)
+        iface = self._rng.choice(self.IFACES)
+        problem_name = template.format(host=host, iface=iface)
+        inc_id = str(self._next_id)
+        self._next_id += 1
+        return Incident(
+            id=inc_id, host=host, problem_name=problem_name, severity=severity,
+            timestamp=datetime.now(), item_key=key, last_value=value,
+        )
 
-            incidents.append(
-                Incident(
-                    id=str(base_id + i),
-                    host=host,
-                    problem_name=problem_name,
-                    severity=severity,
-                    timestamp=now - timedelta(minutes=minutes_ago),
-                    item_key=key,
-                    last_value=value,
-                )
-            )
-        incidents.sort(key=lambda x: x.severity.value, reverse=True)
-        return incidents
+    def get_active_problems(self, count: int = 40) -> List[Incident]:
+        """Первый вызов засевает пул из `count` "активных" проблем (как будто
+        Zabbix только что подключили — сразу видно накопленную историю).
+        Каждый следующий вызов имитирует естественный оборот: часть активных
+        проблем случайно "решается" (пропадает из пула — обнаруживается как
+        закрытие при следующем опросе AlertsTab), несколько новых появляется."""
+        if not self._active:
+            for _ in range(count):
+                inc = self._spawn()
+                self._active[inc.id] = inc
+        else:
+            for inc_id in list(self._active.keys()):
+                if self._rng.random() < 0.12:
+                    del self._active[inc_id]
+            for _ in range(self._rng.randint(0, 3)):
+                inc = self._spawn()
+                self._active[inc.id] = inc
+
+        result = list(self._active.values())
+        result.sort(key=lambda x: x.severity.value, reverse=True)
+        return result

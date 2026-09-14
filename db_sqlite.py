@@ -33,6 +33,8 @@ CREATE TABLE IF NOT EXISTS incidents (
     ai_recommendation TEXT,
     ai_verified     INTEGER NOT NULL DEFAULT 0,
     resolution      TEXT,
+    resolved_at     TEXT,
+    opened_at       TEXT,
     saved_at        TEXT NOT NULL
 );
 
@@ -92,6 +94,15 @@ class SQLiteDatabase:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            # CREATE TABLE IF NOT EXISTS не добавляет колонки в уже существующий
+            # файл БД (в отличие от Postgres-ALTER TABLE ... ADD COLUMN IF NOT
+            # EXISTS в db.py) — на файлах, созданных до появления resolved_at/
+            # opened_at, эта миграция нужна явно, иначе SELECT этих колонок
+            # ниже упадёт с "no such column" на старой локальной БД.
+            existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(incidents)")}
+            for col in ("resolved_at", "opened_at"):
+                if col not in existing_cols:
+                    conn.execute(f"ALTER TABLE incidents ADD COLUMN {col} TEXT")
             for key, value in DEFAULT_SETTINGS.items():
                 conn.execute(
                     "INSERT OR IGNORE INTO app_settings (key, value) VALUES (?, ?)",
@@ -154,7 +165,8 @@ class SQLiteIncidentRepository:
         with self.db._connect() as conn:
             rows = conn.execute(
                 "SELECT id, host, problem_name, severity, timestamp, item_key, "
-                "last_value, ai_summary, ai_recommendation, ai_verified, resolution "
+                "last_value, ai_summary, ai_recommendation, ai_verified, resolution, "
+                "resolved_at, opened_at "
                 "FROM incidents ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
@@ -164,6 +176,8 @@ class SQLiteIncidentRepository:
                 timestamp=datetime.fromisoformat(r[4]), item_key=r[5] or "", last_value=r[6] or "",
                 ai_summary=r[7] or "", ai_recommendation=r[8] or "",
                 ai_analyzed=bool(r[7]), ai_verified=bool(r[9]), resolution=r[10] or "",
+                resolved_at=datetime.fromisoformat(r[11]) if r[11] else None,
+                opened_at=datetime.fromisoformat(r[12]) if r[12] else None,
             )
             for r in rows
         ]
@@ -173,6 +187,26 @@ class SQLiteIncidentRepository:
             conn.execute(
                 "UPDATE incidents SET resolution = ?, ai_verified = 1, saved_at = ? WHERE id = ?",
                 (resolution, datetime.now().isoformat(), incident_id),
+            )
+            conn.commit()
+
+    def mark_resolved(self, ids: List[str]) -> None:
+        if not ids:
+            return
+        with self.db._connect() as conn:
+            placeholders = ",".join("?" * len(ids))
+            conn.execute(
+                f"UPDATE incidents SET resolved_at = ? "
+                f"WHERE id IN ({placeholders}) AND resolved_at IS NULL",
+                (datetime.now().isoformat(), *ids),
+            )
+            conn.commit()
+
+    def mark_opened(self, incident_id: str) -> None:
+        with self.db._connect() as conn:
+            conn.execute(
+                "UPDATE incidents SET opened_at = ? WHERE id = ? AND opened_at IS NULL",
+                (datetime.now().isoformat(), incident_id),
             )
             conn.commit()
 

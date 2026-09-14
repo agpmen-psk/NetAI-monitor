@@ -880,10 +880,18 @@ class IncidentRow(QFrame):
     def __init__(self, incident: Incident):
         super().__init__()
         self.incident = incident
+        is_closed = incident.resolved_at is not None
+        missed = is_closed and incident.opened_at is None
+        # Закрытый алерт — приглушённая полоса (TEXT_MUTED) вместо цвета
+        # критичности: критичность уже не главное, что случилось — она была
+        # актуальна пока алерт был активен. Пропущенный (не открытый инженером
+        # ни разу до закрытия) выделяется отдельно — это как раз тот случай,
+        # который раньше тихо исчезал без следа.
+        border_color = TEXT_MUTED if is_closed else incident.severity.color
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
             f"IncidentRow {{ background: {ROW_BG}; border: none; "
-            f"border-left: 3px solid {incident.severity.color}; "
+            f"border-left: 3px solid {border_color}; "
             f"border-bottom: 1px solid {PANEL_BORDER}; }}"
             f"IncidentRow:hover {{ background: {ROW_HOVER_BG}; }}"
         )
@@ -895,8 +903,16 @@ class IncidentRow(QFrame):
         header.addWidget(_label(incident.host, size=12, weight=700, font=FONT_DATA))
         if incident.ai_verified:
             header.addWidget(_label("✓ проверено", size=9, color=POSITIVE, weight=700))
+        if missed:
+            header.addWidget(_label("пропущено", size=9, color=NEGATIVE, weight=700))
         header.addStretch()
-        header.addWidget(_label(incident.severity.label_ru, size=10, color=incident.severity.color, weight=700))
+        if is_closed:
+            header.addWidget(_label(
+                f"закрыто {incident.resolved_at.strftime('%d.%m %H:%M')}",
+                size=10, color=TEXT_MUTED, weight=700,
+            ))
+        else:
+            header.addWidget(_label(incident.severity.label_ru, size=10, color=incident.severity.color, weight=700))
         layout.addLayout(header)
 
         problem = QLabel(incident.problem_name)
@@ -1196,7 +1212,8 @@ class DashboardTab(QScrollArea):
         side_col = QVBoxLayout()
         side_col.setSpacing(16)
         critical_unresolved = sorted(
-            (i for i in incidents if i.severity in (Severity.HIGH, Severity.DISASTER)),
+            (i for i in incidents
+             if i.severity in (Severity.HIGH, Severity.DISASTER) and i.resolved_at is None),
             key=lambda i: i.timestamp, reverse=True,
         )
         side_col.addWidget(AttentionCard(critical_unresolved))
@@ -1232,11 +1249,31 @@ class DashboardTab(QScrollArea):
 # Алерты
 # ---------------------------------------------------------------------------
 
+TOGGLE_BUTTON_STYLE = f"""
+QPushButton {{ background: {SECONDARY_BG}; color: {TEXT_SECONDARY}; border: 1px solid {PANEL_BORDER};
+    border-radius: 8px; padding: 7px 14px; font-size: 12px; font-weight: 600; }}
+QPushButton:checked {{ background: {ACCENT}; color: {ON_ACCENT_TEXT}; border: 1px solid {ACCENT}; }}
+QPushButton:hover:!checked {{ border: 1px solid {ACCENT}; color: {TEXT_PRIMARY}; }}
+"""
+
+
 class AlertsTab(QWidget):
-    """Работа с инцидентами Zabbix. Использует IncidentRAG для похожих случаев."""
+    """Работа с инцидентами Zabbix в реальном времени. Раз в минуту опрашивает
+    Zabbix, анализирует только НОВЫЕ проблемы через LLM (не переанализирует
+    уже известные при каждом опросе) и определяет закрытие: если ранее
+    активный (и хоть раз пришедший через опрос) инцидент пропал из свежего
+    среза активных — считаем его закрытым в Zabbix и переносим в фильтр
+    «Закрытые», без ожидания следующего ручного обновления. Использует
+    IncidentRAG для похожих случаев."""
 
     incident_added = Signal()
     unread_changed = Signal(bool)
+    # Испускается при появлении новых проанализированных алертов (и через
+    # реальное время, и через прямую отправку из Генератора) — MainWindow
+    # слушает это, чтобы показать всплывающий тост поверх любой вкладки.
+    new_realtime_alert = Signal(list)
+
+    POLL_INTERVAL_MS = 60_000
 
     def __init__(self, zabbix_client, analyzer, repo: IncidentRepository, rag=None):
         super().__init__()
@@ -1244,29 +1281,28 @@ class AlertsTab(QWidget):
         self.analyzer = analyzer
         self.repo = repo
         self.rag = rag
-        self._live_workers: list[IncidentWorker] = []
+        self._live_workers: list[QThread] = []
         self._unread_ids: set[str] = set()
+        self._show_closed = False
+        # id, которые хоть раз реально приходили из опроса Zabbix (а не были
+        # вручную отправлены из Центра генерации) — только они являются
+        # кандидатами на автозакрытие, когда пропадают из свежего среза.
+        # Иначе синтетический алерт, отправленный вручную через Генератор
+        # (Zabbix о нём ничего не знает), был бы «закрыт» уже на первом же
+        # следующем опросе — ложное срабатывание.
+        self._polled_ids: set[str] = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(14)
 
         top_bar = QHBoxLayout()
-        self.refresh_btn = QPushButton("Обновить и проанализировать")
+        self.refresh_btn = QPushButton("Проверить сейчас")
         self.refresh_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
-        self.refresh_btn.clicked.connect(self.refresh)
+        self.refresh_btn.clicked.connect(self._manual_poll)
         top_bar.addWidget(self.refresh_btn)
 
-        self.auto_refresh_checkbox = QCheckBox("Автообновление")
-        self.auto_refresh_checkbox.toggled.connect(self._toggle_auto_refresh)
-        top_bar.addWidget(self.auto_refresh_checkbox)
-
-        self.auto_refresh_interval = ComboBox()
-        self.auto_refresh_interval.addItem("каждую минуту", 60_000)
-        self.auto_refresh_interval.addItem("каждые 5 минут", 5 * 60_000)
-        self.auto_refresh_interval.addItem("каждые 15 минут", 15 * 60_000)
-        self.auto_refresh_interval.setCurrentIndex(1)
-        self.auto_refresh_interval.currentIndexChanged.connect(self._toggle_auto_refresh)
-        top_bar.addWidget(self.auto_refresh_interval)
+        self.realtime_indicator = _label("● реальное время: опрос раз в минуту", size=11, color=POSITIVE, weight=700)
+        top_bar.addWidget(self.realtime_indicator)
 
         top_bar.addStretch()
 
@@ -1280,10 +1316,27 @@ class AlertsTab(QWidget):
         top_bar.addWidget(rag_status)
         root.addLayout(top_bar)
 
-        self._auto_timer = QTimer(self)
-        self._auto_timer.timeout.connect(self._auto_refresh_tick)
+        self._realtime_timer = QTimer(self)
+        self._realtime_timer.timeout.connect(self._realtime_tick)
 
         filter_row = QHBoxLayout()
+        self.view_group = QButtonGroup(self)
+        self.view_group.setExclusive(True)
+        self.view_active_btn = QPushButton("Активные")
+        self.view_active_btn.setCheckable(True)
+        self.view_active_btn.setChecked(True)
+        self.view_active_btn.setStyleSheet(TOGGLE_BUTTON_STYLE)
+        self.view_active_btn.setCursor(Qt.PointingHandCursor)
+        self.view_closed_btn = QPushButton("Закрытые")
+        self.view_closed_btn.setCheckable(True)
+        self.view_closed_btn.setStyleSheet(TOGGLE_BUTTON_STYLE)
+        self.view_closed_btn.setCursor(Qt.PointingHandCursor)
+        self.view_group.addButton(self.view_active_btn, 0)
+        self.view_group.addButton(self.view_closed_btn, 1)
+        self.view_group.idClicked.connect(self._toggle_view)
+        filter_row.addWidget(self.view_active_btn)
+        filter_row.addWidget(self.view_closed_btn)
+
         self.search_edit = QLineEdit()
         self.search_edit.setPlaceholderText("Поиск по хосту или описанию проблемы...")
         self.search_edit.textChanged.connect(self._apply_filters)
@@ -1361,6 +1414,15 @@ class AlertsTab(QWidget):
         # то, что уже было в истории при открытии приложения, не считается «новым» —
         # непрочитанным помечается только то, что появится после этого момента
         self._seen_ids = {inc.id for inc in self._all_incidents}
+        # При старте оптимистично считаем всё, что уже числится активным в
+        # БД, пришедшим из опроса — иначе эти записи никогда не попадут под
+        # автозакрытие, пока реально не встретятся в свежем ответе Zabbix
+        # (для только что отправленных вручную из Генератора это тоже верно
+        # в большинстве случаев, редкое исключение не критично для демо-фичи).
+        self._polled_ids = {inc.id for inc in self._all_incidents if inc.resolved_at is None}
+
+        self._realtime_timer.start(self.POLL_INTERVAL_MS)
+        QTimer.singleShot(200, self._realtime_tick)
 
     def _load_history(self):
         self._all_incidents = self.repo.get_history()
@@ -1371,7 +1433,10 @@ class AlertsTab(QWidget):
         severity = self.severity_filter.currentData()
         unverified_only = self.unverified_only_checkbox.isChecked()
 
-        filtered = self._all_incidents
+        if self._show_closed:
+            filtered = [i for i in self._all_incidents if i.resolved_at is not None]
+        else:
+            filtered = [i for i in self._all_incidents if i.resolved_at is None]
         if query:
             filtered = [i for i in filtered if query in i.host.lower() or query in i.problem_name.lower()]
         if severity is not None:
@@ -1388,39 +1453,99 @@ class AlertsTab(QWidget):
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, widget)
 
-    def _toggle_auto_refresh(self):
-        if self.auto_refresh_checkbox.isChecked():
-            self._auto_timer.start(self.auto_refresh_interval.currentData())
-        else:
-            self._auto_timer.stop()
+        missed_count = sum(1 for i in self._all_incidents if i.resolved_at is not None and i.opened_at is None)
+        self.view_closed_btn.setText(f"Закрытые ({missed_count} пропущено)" if missed_count else "Закрытые")
 
-    def _auto_refresh_tick(self):
-        # Не запускаем новый опрос, если предыдущий (обычный или из
-        # Центра генерации) ещё выполняется — иначе воркеры будут копиться.
-        if not self.refresh_btn.isEnabled() or self._live_workers:
+    def _toggle_view(self, button_id: int) -> None:
+        self._show_closed = button_id == 1
+        self._apply_filters()
+
+    def _manual_poll(self) -> None:
+        """Кнопка «Проверить сейчас» — тот же опрос, что и по таймеру, просто
+        по требованию инженера, не дожидаясь следующей минуты."""
+        if self._live_workers:
             return
-        self.refresh()
+        self._realtime_tick()
 
-    def refresh(self):
+    def _realtime_tick(self) -> None:
+        """Раз в минуту (и по кнопке «Проверить сейчас»): лёгкий опрос Zabbix
+        БЕЗ анализа (см. _on_poll_fetched — анализируются только новые id),
+        чтобы не гонять LLM по уже известным активным проблемам на каждом
+        тике. Если предыдущий опрос/анализ ещё выполняется — тик пропускаем,
+        воркеры не копим."""
+        if self._live_workers:
+            return
         self.refresh_btn.setEnabled(False)
-        self.refresh_btn.setText("Анализирую...")
-        self.worker = IncidentWorker(self.zabbix_client, self.analyzer, rag=self.rag)
-        self.worker.finished.connect(self._on_finished)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
+        worker = ConfigTaskWorker(self.zabbix_client.get_active_problems)
+        worker.finished.connect(lambda fetched: self._on_poll_fetched(worker, fetched))
+        worker.error.connect(lambda msg: self._on_poll_error(worker, msg))
+        self._live_workers.append(worker)
+        worker.start()
 
-    def _on_finished(self, incidents):
+    def _on_poll_error(self, worker: QThread, message: str) -> None:
+        if worker in self._live_workers:
+            self._live_workers.remove(worker)
+        self.refresh_btn.setEnabled(True)
+        self.realtime_indicator.setText("● реальное время: ошибка опроса")
+        self.realtime_indicator.setStyleSheet(f"color: {NEGATIVE}; font-size: 11px; font-weight: 700; border: none; background: transparent;")
+        self.live_status_label.setText(f"Опрос Zabbix не удался: {message}")
+        self.live_status_label.setStyleSheet(f"color: {NEGATIVE}; font-size: 11px; border: none; background: transparent;")
+
+    def _on_poll_fetched(self, worker: QThread, fetched: list[Incident]) -> None:
+        if worker in self._live_workers:
+            self._live_workers.remove(worker)
+        self.realtime_indicator.setText("● реальное время: опрос раз в минуту")
+        self.realtime_indicator.setStyleSheet(f"color: {POSITIVE}; font-size: 11px; font-weight: 700; border: none; background: transparent;")
+
+        fetched_ids = {i.id for i in fetched}
+        self._polled_ids |= fetched_ids
+        known_ids = {i.id for i in self._all_incidents}
+        new_incidents = [i for i in fetched if i.id not in known_ids]
+        closed_ids = [
+            i.id for i in self._all_incidents
+            if i.resolved_at is None and i.id in self._polled_ids and i.id not in fetched_ids
+        ]
+
+        if closed_ids:
+            self.repo.mark_resolved(closed_ids)
+
+        if new_incidents:
+            analyze_worker = IncidentWorker(self.zabbix_client, self.analyzer, rag=self.rag, incidents=new_incidents)
+            analyze_worker.finished.connect(lambda incs: self._on_realtime_analyzed(analyze_worker, incs, len(closed_ids)))
+            analyze_worker.error.connect(lambda msg: self._on_live_error(analyze_worker, msg))
+            self._live_workers.append(analyze_worker)
+            analyze_worker.start()
+        else:
+            self.refresh_btn.setEnabled(True)
+            if closed_ids:
+                self._load_history()
+                self.incident_added.emit()
+            self._set_poll_status(new_count=0, closed_count=len(closed_ids))
+
+    def _on_realtime_analyzed(self, worker: QThread, incidents: list[Incident], closed_count: int) -> None:
+        if worker in self._live_workers:
+            self._live_workers.remove(worker)
         self._save_and_embed(incidents)
         self._load_history()
         self.refresh_btn.setEnabled(True)
-        self.refresh_btn.setText("Обновить и проанализировать")
         self._mark_unread(incidents)
         self.incident_added.emit()
+        self._set_poll_status(new_count=len(incidents), closed_count=closed_count)
+        if incidents:
+            self.new_realtime_alert.emit(incidents)
 
-    def _on_error(self, message):
-        self.detail_view.setPlainText(f"Ошибка: {message}")
-        self.refresh_btn.setEnabled(True)
-        self.refresh_btn.setText("Обновить и проанализировать")
+    def _set_poll_status(self, new_count: int, closed_count: int) -> None:
+        parts = []
+        if new_count:
+            parts.append(f"новых: {new_count}")
+        if closed_count:
+            parts.append(f"закрыто: {closed_count}")
+        text = "Обновлено — " + ", ".join(parts) if parts else "Проверено — изменений нет"
+        self.live_status_label.setText(text)
+        self.live_status_label.setStyleSheet(
+            f"color: {POSITIVE if (new_count or closed_count) else TEXT_MUTED}; "
+            f"font-size: 11px; border: none; background: transparent;"
+        )
 
     def _save_and_embed(self, incidents: list[Incident]) -> None:
         self.repo.save_incidents(incidents)
@@ -1470,6 +1595,8 @@ class AlertsTab(QWidget):
             self._live_workers.remove(worker)
         self._mark_unread(incidents)
         self.incident_added.emit()
+        if incidents:
+            self.new_realtime_alert.emit(incidents)
 
     # Заметно строже общего RAG-порога релевантности (см. rag.py max_distance=0.4
     # по умолчанию для контекста промпта) — для «это дубликат» нужна почти
@@ -1520,11 +1647,26 @@ class AlertsTab(QWidget):
     def _on_select(self, item):
         inc: Incident = item.data(Qt.UserRole)
         self._selected_incident = inc
+        if inc.opened_at is None:
+            self.repo.mark_opened(inc.id)
+            inc.opened_at = datetime.now()
+            # Строка могла быть отрисована с бейджем «пропущено» (закрытый,
+            # ни разу не открытый алерт) — теперь он открыт, бейдж больше не
+            # актуален, перерисовываем список, чтобы это отразилось сразу.
+            if inc.resolved_at is not None:
+                # QTimer.singleShot — не перестраиваем list_widget прямо
+                # внутри обработчика itemClicked того же списка (элемент,
+                # чей клик мы сейчас обрабатываем, иначе был бы удалён
+                # посреди собственного обработчика).
+                QTimer.singleShot(0, self._apply_filters)
         verified_note = f"\n\n--- Как решено фактически (инженер) ---\n{inc.resolution}\n" \
             if inc.ai_verified and inc.resolution else ""
+        closed_note = f"\n--- Статус: закрыт в Zabbix {inc.resolved_at.strftime('%d.%m.%Y %H:%M')} ---\n" \
+            if inc.resolved_at else ""
         text = (
             f"Хост: {inc.host}\nПроблема: {inc.problem_name}\nКритичность: {inc.severity.label_ru}\n"
             f"Время: {inc.timestamp.strftime('%d.%m.%Y %H:%M')}\nПараметр: {inc.item_key} = {inc.last_value}\n"
+            f"{closed_note}"
             f"\n--- Суть проблемы (ИИ) ---\n{inc.ai_summary}\n"
             f"\n--- Рекомендация ИИ ---\n{inc.ai_recommendation}\n"
             f"{verified_note}"
@@ -3285,7 +3427,8 @@ class Sidebar(QWidget):
 
         incidents = self.incident_repo.get_history(limit=200)
         critical = sorted(
-            (i for i in incidents if i.severity in (Severity.HIGH, Severity.DISASTER)),
+            (i for i in incidents
+             if i.severity in (Severity.HIGH, Severity.DISASTER) and i.resolved_at is None),
             key=lambda i: i.timestamp, reverse=True,
         )
         self.queue_count_label.setText(str(len(critical)))
@@ -3313,6 +3456,71 @@ class Sidebar(QWidget):
 # ---------------------------------------------------------------------------
 # Главное окно
 # ---------------------------------------------------------------------------
+
+class Toast(QWidget):
+    """Всплывающий баннер поверх интерфейса — сигнализирует о новом алерте в
+    реальном времени, пока оператор смотрит другую вкладку (без него легко
+    пропустить: сайдбар в это время показывает только тихую красную точку)."""
+
+    def __init__(self, parent: QWidget):
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setObjectName("Toast")
+        self.setStyleSheet(
+            f"#Toast {{ background: {PANEL_BG}; border: 1px solid {PANEL_BORDER}; "
+            f"border-left: 4px solid {ACCENT}; border-radius: 12px; }}"
+        )
+        _elevate(self, blur=30, y_offset=8, alpha=45)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 12, 10, 12)
+        layout.setSpacing(10)
+
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        self.title_label = _label("", size=12, weight=700)
+        self.title_label.setWordWrap(True)
+        self.subtitle_label = _label("", size=11, color=TEXT_SECONDARY)
+        self.subtitle_label.setWordWrap(True)
+        text_col.addWidget(self.title_label)
+        text_col.addWidget(self.subtitle_label)
+        layout.addLayout(text_col, stretch=1)
+
+        close_btn = QPushButton("✕")
+        close_btn.setFixedSize(22, 22)
+        close_btn.setCursor(Qt.PointingHandCursor)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background: transparent; color: {TEXT_MUTED}; border: none; "
+            f"border-radius: 11px; font-size: 12px; }}"
+            f"QPushButton:hover {{ background: {ROW_HOVER_BG}; color: {TEXT_PRIMARY}; }}"
+        )
+        close_btn.clicked.connect(self.hide)
+        layout.addWidget(close_btn, alignment=Qt.AlignTop)
+
+        self.setFixedWidth(360)
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide)
+        self.hide()
+
+    def show_message(self, title: str, subtitle: str) -> None:
+        self.title_label.setText(title)
+        self.subtitle_label.setText(subtitle)
+        self.adjustSize()
+        self.reposition()
+        self.raise_()
+        self.show()
+        self._hide_timer.start(6000)
+
+    def reposition(self) -> None:
+        # Правый нижний угол — сверху почти на всех вкладках уже стоит своя
+        # панель действий/фильтров (кнопки, поиск, статус RAG), тост её
+        # перекрывал бы; внизу свободнее независимо от активной вкладки.
+        parent_rect = self.parentWidget().rect()
+        self.move(
+            parent_rect.width() - self.width() - 24,
+            parent_rect.height() - self.height() - 24,
+        )
+
 
 class MainWindow(QMainWindow):
     def __init__(self, incident_repo, config_repo, settings_manager: SettingsManager,
@@ -3362,6 +3570,9 @@ class MainWindow(QMainWindow):
         self.configs_tab.config_added.connect(self._on_live_data_changed)
         self.alerts_tab.unread_changed.connect(lambda visible: self.sidebar.set_badge(1, visible))
 
+        self.toast = Toast(central)
+        self.alerts_tab.new_realtime_alert.connect(self._show_toast)
+
         self.sidebar.group.idClicked.connect(self._on_nav_clicked)
         self.setCentralWidget(central)
 
@@ -3383,6 +3594,19 @@ class MainWindow(QMainWindow):
         elif index == 6:
             self.analytics_tab.refresh()
         self.sidebar.refresh_queue()
+
+    def _show_toast(self, incidents: list) -> None:
+        if len(incidents) == 1:
+            inc = incidents[0]
+            self.toast.show_message(f"Новый алерт: {inc.host}", inc.problem_name[:80])
+        else:
+            hosts = ", ".join(sorted({i.host for i in incidents})[:3])
+            self.toast.show_message(f"Новые алерты: {len(incidents)}", hosts)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "toast") and self.toast.isVisible():
+            self.toast.reposition()
 
     def _on_live_data_changed(self):
         """Срабатывает при поступлении нового алерта/конфигурации (из Центра

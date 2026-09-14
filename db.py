@@ -48,6 +48,11 @@ CREATE TABLE IF NOT EXISTS incidents (
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS embedding vector(768);
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS ai_verified BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolution TEXT;
+-- resolved_at: когда проблема пропала из активных в Zabbix (реальное время,
+-- см. AlertsTab). opened_at: когда инженер реально открыл карточку алерта —
+-- независимо друг от друга, оба NULL у только что пришедшего активного алерта.
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS resolved_at TIMESTAMP;
+ALTER TABLE incidents ADD COLUMN IF NOT EXISTS opened_at TIMESTAMP;
 
 CREATE TABLE IF NOT EXISTS config_diffs (
     id              SERIAL PRIMARY KEY,
@@ -173,7 +178,8 @@ class IncidentRepository:
             with conn.cursor() as cur:
                 cur.execute(
                     "SELECT id, host, problem_name, severity, timestamp, item_key, "
-                    "last_value, ai_summary, ai_recommendation, ai_verified, resolution FROM incidents "
+                    "last_value, ai_summary, ai_recommendation, ai_verified, resolution, "
+                    "resolved_at, opened_at FROM incidents "
                     "ORDER BY timestamp DESC LIMIT %s",
                     (limit,),
                 )
@@ -185,9 +191,37 @@ class IncidentRepository:
                 timestamp=r[4], item_key=r[5] or "", last_value=r[6] or "",
                 ai_summary=r[7] or "", ai_recommendation=r[8] or "",
                 ai_analyzed=bool(r[7]), ai_verified=bool(r[9]), resolution=r[10] or "",
+                resolved_at=r[11], opened_at=r[12],
             )
             for r in rows
         ]
+
+    def mark_resolved(self, ids: List[str]) -> None:
+        """Проставляет resolved_at тем алертам из списка, которые ещё не были
+        закрыты — вызывается, когда опрос Zabbix перестал возвращать их среди
+        активных (см. AlertsTab._on_poll_fetched)."""
+        if not ids:
+            return
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE incidents SET resolved_at = now() "
+                    "WHERE id = ANY(%s) AND resolved_at IS NULL",
+                    (ids,),
+                )
+            conn.commit()
+
+    def mark_opened(self, incident_id: str) -> None:
+        """Инженер открыл карточку алерта — фиксируем первый факт просмотра,
+        независимо от того, закрыт ли уже алерт в Zabbix."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE incidents SET opened_at = now() "
+                    "WHERE id = %s AND opened_at IS NULL",
+                    (incident_id,),
+                )
+            conn.commit()
 
     def update_correction(self, incident_id: str, resolution: str) -> None:
         """Инженер вписал, как проблема была решена на самом деле. Хранится

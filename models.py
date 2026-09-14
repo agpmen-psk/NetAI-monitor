@@ -48,7 +48,14 @@ class Incident:
     timestamp: datetime
     item_key: str = ""
     last_value: str = ""
-    resolved: bool = False
+
+    # Жизненный цикл алерта в реальном времени (см. AlertsTab): resolved_at
+    # проставляется, когда проблема пропала из активных в Zabbix — не когда
+    # инженер её просмотрел. opened_at — когда инженер реально открыл карточку
+    # (клик по строке), независимо от того, закрыт ли уже алерт в Zabbix.
+    # Оба None у только что пришедшего активного алерта.
+    resolved_at: datetime | None = None
+    opened_at: datetime | None = None
 
     # Поля, заполняемые после анализа LLM
     ai_summary: str = ""
