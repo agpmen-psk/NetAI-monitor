@@ -4,11 +4,10 @@ gui.py — интерфейс NetAI Monitor v2 с RAG.
 Алерты и Конфигурации используют IncidentRAG/ConfigRAG (если доступны) —
 похожие прошлые случаи автоматически подмешиваются в промпт LLM.
 
-Стиль — тёмный «glow»-дашборд со скруглёнными карточками, радиальной подсветкой
-фона и мини-графиками (линия/бар/донат), построенными на реальных метриках
-приложения: инциденты, риск конфигураций, доля разбора ИИ, конвейер анализа.
-Слева — постоянный сайдбар: навигация, очередь критичных инцидентов, недавняя
-активность ИИ, быстрый доступ к вкладкам.
+Стиль — светлый, спокойный дашборд для целого рабочего дня: холодный
+светло-серый фон, белые карточки, приглушённый синий акцент, мини-графики
+(линия/бар/донат), построенные на реальных метриках приложения. Сайдбар —
+единственная тёмная (графитная) зона, постоянный визуальный якорь навигации.
 """
 from __future__ import annotations
 
@@ -30,6 +29,7 @@ from PySide6.QtWidgets import (
     QLabel, QPushButton, QListWidget, QListWidgetItem, QTextEdit, QLineEdit,
     QSplitter, QStatusBar, QFrame, QButtonGroup, QStackedWidget, QSizePolicy,
     QCheckBox, QFormLayout, QMessageBox, QComboBox, QScrollArea, QDialog, QFileDialog,
+    QGraphicsDropShadowEffect,
 )
 
 from models import Incident, Severity
@@ -40,43 +40,94 @@ from zabbix_client import MockZabbixClient, ZabbixClient
 from mock_oxidized_client import MockOxidizedClient
 from oxidized_client import OxidizedClient
 from rag import EmbeddingClient
-from local_config import load_postgres_config, save_postgres_config, build_dsn
+from local_config import load_postgres_config, save_postgres_config, build_dsn, load_theme, save_theme
 from chat_query import build_context as build_chat_context
 
 # ---------------------------------------------------------------------------
 # Токены дизайна
 # ---------------------------------------------------------------------------
 
-# Палитра заземлена в диспетчерской/КИПиА-эстетике энергосетевого NOC, а не
-# в стоковом «AI SaaS dashboard» (тёмный фон + один синий акцент — это
-# буквально узнаваемый генеративный тилл). ACCENT — приглушённый циан,
-# ассоциация со следом на осциллографе/радаре, сознательно не пересекается
-# ни с фирменным индиго ИИ-чатов, ни с цветами критичности инцидентов
-# (те взяты из реальной палитры Zabbix, см. models.py, и не меняются).
-BG_TOP = "#141A1C"
-BG = "#0C1012"
-SIDEBAR_BG = "#0A0E10"
-PANEL_BG = "rgba(255, 255, 255, 0.035)"
-PANEL_BORDER = "rgba(255, 255, 255, 0.07)"
-TRACK_BG = "#1D2325"
+# Светлая тема по умолчанию — рабочий инструмент NOC-инженера на весь день,
+# а не «AI SaaS»-витрина: холодный светло-серый фон вместо белого (меньше
+# усталости глаз при длительном чтении), белые карточки с мягкой тенью
+# вместо тёмных стеклянных панелей. Единственная тёмная зона — сайдбар
+# (графитно-синий, SIDEBAR_*) — фиксированный визуальный якорь навигации,
+# не связанный с остальной палитрой. ACCENT — приглушённый синий, спокойный,
+# не спорит с насыщенными статусами критичности (те берутся из реальной
+# палитры Zabbix, см. models.py, и не меняются).
+BG = "#EEF1F5"
+BG_TOP = "#E5E9EF"
+SIDEBAR_BG = "#1C2530"
+PANEL_BG = "#FFFFFF"
+PANEL_BORDER = "#E1E5EC"
+TRACK_BG = "#E7EAF0"
 # Непрозрачная подложка для чата — без неё сетка/виньетка фона (GlowBackground)
 # просвечивает сквозь всю область сообщений и спорит с пузырями.
-SURFACE = "#12171A"
-TEXT_PRIMARY = "#E8EAEA"
-TEXT_SECONDARY = "#8B9294"
-TEXT_MUTED = "#565C5E"
-ACCENT = "#3FB6B6"
-ACCENT_LIGHT = "#6ECFCF"
-POSITIVE = "#4FA47B"
-NEGATIVE = "#D9645A"
-WARNING = "#D6A544"
+SURFACE = "#FFFFFF"
+TEXT_PRIMARY = "#1E2530"
+TEXT_SECONDARY = "#5B6672"
+TEXT_MUTED = "#8D96A3"
+ACCENT = "#3E6FA0"
+ACCENT_LIGHT = "#5989BD"
+POSITIVE = "#2FA36B"
+NEGATIVE = "#DC4C3F"
+WARNING = "#DB9A22"
 
-# IBM Plex Mono — инженерный моноширинный шрифт (данные/идентификаторы/diff);
-# PT Sans — шрифт ParaType, спроектированный для официальной русскоязычной
-# типографики (интерфейс/текст). Оба зашиты в exe (см. load_bundled_fonts),
-# рендерятся одинаково независимо от того, что установлено на компьютере.
-FONT_DATA = "'IBM Plex Mono', 'Consolas', monospace"
-FONT_TEXT = "'PT Sans', 'Segoe UI', sans-serif"
+# Токены только для тёмного сайдбара — общие TEXT_*/PANEL_BORDER здесь не
+# подходят (они рассчитаны на белые карточки), а сайдбар остаётся тёмным
+# островом независимо от общей светлой темы.
+SIDEBAR_TEXT = "#E4E8EE"
+SIDEBAR_TEXT_SECONDARY = "#9BA5B4"
+SIDEBAR_TEXT_MUTED = "#6C7686"
+SIDEBAR_BORDER = "rgba(255,255,255,0.08)"
+
+# Дополнительные ролевые токены — раньше эти места были захардкожены
+# буквальными #FFFFFF/rgba(...), из-за чего тёмная тема (см. ниже) не могла
+# их переопределить. Вынесены в токены специально ради переключателя темы.
+FIELD_BG = "#FFFFFF"          # поля ввода / комбобоксы
+POPUP_BG = "#FFFFFF"          # QMessageBox, выпадающий список комбобокса
+ON_ACCENT_TEXT = "#FFFFFF"    # текст на акцентной заливке (кнопки)
+DISABLED_BG = "#E7EAF0"       # неактивная кнопка
+SECONDARY_BG = "#FFFFFF"      # вторичная кнопка
+ROW_BG = "#FFFFFF"            # строка списка (Алерты/Конфигурации)
+ROW_HOVER_BG = "#F2F5F9"      # строка списка при наведении
+INSET_BG = "#F3F5F8"          # поле QTextEdit внутри карточки/диалога
+GRID_LINE_RGBA = (30, 37, 48, 10)   # едва заметная сетка фона
+VIGNETTE_ALPHA = 130                # альфа тихой виньетки фона
+
+# Inter — геометричный, нейтральный, современный интерфейсный шрифт;
+# JetBrains Mono — моноширинный для данных/идентификаторов/diff'ов. Оба —
+# вариативные шрифты (один файл на все насыщенности), зашиты в exe (см.
+# load_bundled_fonts), рендерятся одинаково независимо от того, что
+# установлено на компьютере.
+FONT_DATA = "'JetBrains Mono', 'Consolas', monospace"
+FONT_TEXT = "'Inter', 'Segoe UI', sans-serif"
+
+# Тёмная тема — доступна через переключатель на вкладке Настройки. Значения
+# применяются после перезапуска (см. run_app): темизация здесь основана на
+# module-level константах, «запечённых» в QSS-строки и кастомных QPainter-
+# виджетах при создании — живого переключения без перезапуска сознательно
+# не делали, чтобы не усложнять архитектуру перед защитой диплома (тот же
+# принцип, что и у смены подключения PostgreSQL).
+DARK_PALETTE = {
+    "BG": "#0C1012", "BG_TOP": "#141A1C", "SIDEBAR_BG": "#0A0E10",
+    "PANEL_BG": "rgba(255, 255, 255, 0.035)", "PANEL_BORDER": "rgba(255, 255, 255, 0.07)",
+    "TRACK_BG": "#1D2325", "SURFACE": "#12171A",
+    "TEXT_PRIMARY": "#E8EAEA", "TEXT_SECONDARY": "#8B9294", "TEXT_MUTED": "#565C5E",
+    "ACCENT": "#3FB6B6", "ACCENT_LIGHT": "#6ECFCF",
+    "POSITIVE": "#4FA47B", "NEGATIVE": "#D9645A", "WARNING": "#D6A544",
+    "SIDEBAR_TEXT": "#E8EAEA", "SIDEBAR_TEXT_SECONDARY": "#8B9294",
+    "SIDEBAR_TEXT_MUTED": "#565C5E", "SIDEBAR_BORDER": "rgba(255, 255, 255, 0.07)",
+    "FIELD_BG": "rgba(255,255,255,0.05)", "POPUP_BG": "#10141F", "ON_ACCENT_TEXT": "#0A0D18",
+    "DISABLED_BG": "rgba(255,255,255,0.06)", "SECONDARY_BG": "rgba(255,255,255,0.04)",
+    "ROW_BG": "rgba(255,255,255,0.018)", "ROW_HOVER_BG": "rgba(255,255,255,0.055)",
+    "INSET_BG": "rgba(255,255,255,0.03)",
+    "GRID_LINE_RGBA": (255, 255, 255, 6), "VIGNETTE_ALPHA": 90,
+}
+
+CURRENT_THEME = load_theme()
+if CURRENT_THEME == "dark":
+    globals().update(DARK_PALETTE)
 
 APP_STYLESHEET = f"""
 QMainWindow {{ background-color: {BG}; }}
@@ -91,60 +142,64 @@ QTextEdit {{
     font-family: {FONT_DATA}; font-size: 12px;
 }}
 QLineEdit {{
-    background: rgba(255,255,255,0.05); border: 1px solid {PANEL_BORDER};
+    background: {FIELD_BG}; border: 1px solid {PANEL_BORDER};
     border-radius: 8px; padding: 8px; color: {TEXT_PRIMARY};
     font-family: {FONT_DATA}; font-size: 12px;
 }}
 QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
 QCheckBox {{ font-size: 12px; }}
 QComboBox {{
-    background: rgba(255,255,255,0.05); border: 1px solid {PANEL_BORDER};
+    background: {FIELD_BG}; border: 1px solid {PANEL_BORDER};
     border-radius: 8px; padding: 6px; color: {TEXT_PRIMARY}; font-family: {FONT_DATA};
 }}
 QComboBox::drop-down {{ border: none; }}
 QComboBox QAbstractItemView {{
-    background: #10141F; color: {TEXT_PRIMARY}; border: 1px solid {PANEL_BORDER};
-    selection-background-color: {ACCENT}; selection-color: #0A0D18;
+    background: {POPUP_BG}; color: {TEXT_PRIMARY}; border: 1px solid {PANEL_BORDER};
+    selection-background-color: {ACCENT}; selection-color: {ON_ACCENT_TEXT};
     outline: none; padding: 4px;
 }}
 QScrollArea {{ background: transparent; border: none; }}
 QScrollBar:vertical {{ background: transparent; width: 6px; }}
 QScrollBar::handle:vertical {{ background: {PANEL_BORDER}; border-radius: 3px; min-height: 24px; }}
 
-QMessageBox {{ background-color: #10141F; }}
+QMessageBox {{ background-color: {POPUP_BG}; }}
 QMessageBox QLabel {{ color: {TEXT_PRIMARY}; background: transparent; font-size: 13px; }}
 QMessageBox QPushButton {{
-    background: {ACCENT}; color: #0A0D18; border: none; border-radius: 8px;
+    background: {ACCENT}; color: {ON_ACCENT_TEXT}; border: none; border-radius: 8px;
     padding: 6px 16px; font-size: 12px; font-weight: 600; min-width: 70px;
 }}
 QMessageBox QPushButton:hover {{ background: {ACCENT_LIGHT}; }}
 """
 
 PRIMARY_BUTTON_STYLE = f"""
-QPushButton {{ background: {ACCENT}; color: #0A0D18; border: none; border-radius: 8px;
+QPushButton {{ background: {ACCENT}; color: {ON_ACCENT_TEXT}; border: none; border-radius: 8px;
     padding: 9px 16px; font-size: 12px; font-weight: 600; }}
-QPushButton:disabled {{ background: rgba(255,255,255,0.06); color: {TEXT_MUTED}; }}
+QPushButton:disabled {{ background: {DISABLED_BG}; color: {TEXT_MUTED}; }}
 QPushButton:hover:!disabled {{ background: {ACCENT_LIGHT}; }}
 """
 
 SECONDARY_BUTTON_STYLE = f"""
-QPushButton {{ background: rgba(255,255,255,0.04); color: {TEXT_SECONDARY}; border: 1px solid {PANEL_BORDER};
+QPushButton {{ background: {SECONDARY_BG}; color: {TEXT_SECONDARY}; border: 1px solid {PANEL_BORDER};
     border-radius: 8px; padding: 8px 16px; font-size: 12px; font-weight: 600; }}
 QPushButton:disabled {{ color: {TEXT_MUTED}; }}
 QPushButton:hover:!disabled {{ border: 1px solid {ACCENT}; color: {TEXT_PRIMARY}; }}
 """
 
+# NAV_BUTTON_STYLE/QUICK_BUTTON_STYLE — единственные стили, рассчитанные на
+# тёмный сайдбар (SIDEBAR_BG), а не на общую светлую поверхность, поэтому
+# сознательно используют SIDEBAR_*-токены и полупрозрачные белые оверлеи
+# (осветление поверх тёмного фона), а не общие TEXT_*/PANEL_BORDER.
 NAV_BUTTON_STYLE = f"""
-QPushButton {{ background: transparent; color: {TEXT_SECONDARY}; border: none; border-radius: 10px;
+QPushButton {{ background: transparent; color: {SIDEBAR_TEXT_SECONDARY}; border: none; border-radius: 10px;
     padding: 9px 14px; font-size: 12px; font-weight: 600; text-align: left; }}
-QPushButton:checked {{ background: rgba(91,141,239,0.16); color: {TEXT_PRIMARY}; }}
-QPushButton:hover:!checked {{ background: rgba(255,255,255,0.04); }}
+QPushButton:checked {{ background: rgba(255,255,255,0.12); color: {SIDEBAR_TEXT}; }}
+QPushButton:hover:!checked {{ background: rgba(255,255,255,0.06); }}
 """
 
 QUICK_BUTTON_STYLE = f"""
-QPushButton {{ background: rgba(255,255,255,0.04); color: {TEXT_SECONDARY}; border: 1px solid {PANEL_BORDER};
+QPushButton {{ background: rgba(255,255,255,0.06); color: {SIDEBAR_TEXT_SECONDARY}; border: 1px solid {SIDEBAR_BORDER};
     border-radius: 10px; padding: 10px 6px; font-size: 10px; font-weight: 600; }}
-QPushButton:hover {{ border: 1px solid {ACCENT}; color: {TEXT_PRIMARY}; }}
+QPushButton:hover {{ border: 1px solid {ACCENT_LIGHT}; color: {SIDEBAR_TEXT}; }}
 """
 
 RISK_COLORS = {"LOW": POSITIVE, "MEDIUM": WARNING, "HIGH": NEGATIVE, "UNKNOWN": TEXT_MUTED}
@@ -163,11 +218,13 @@ def app_icon() -> QIcon:
 
 
 def load_bundled_fonts() -> None:
-    """Регистрирует IBM Plex Mono/PT Sans из assets/fonts — так интерфейс
+    """Регистрирует Inter/JetBrains Mono из assets/fonts — так интерфейс
     рендерится одинаково на любом компьютере (в т.ч. на защите), а не
-    откатывается на системный шрифт, если PT Sans/Plex не установлены.
-    Если по какой-то причине файлы не найдены — QSS-стек всё равно
-    подстрахован системными шрифтами ('Segoe UI', 'Consolas')."""
+    откатывается на системный шрифт, если они не установлены в системе.
+    Оба — вариативные шрифты (один .ttf на все насыщенности от Regular до
+    Bold), Qt разрешает нужную насыщенность из font-weight в QSS/QFont
+    автоматически. Если по какой-то причине файлы не найдены — QSS-стек
+    всё равно подстрахован системными шрифтами ('Segoe UI', 'Consolas')."""
     fonts_dir = resource_path(os.path.join("assets", "fonts"))
     if not os.path.isdir(fonts_dir):
         return
@@ -177,10 +234,10 @@ def load_bundled_fonts() -> None:
 
 
 MESSAGE_BOX_STYLESHEET = f"""
-QMessageBox {{ background-color: #10141F; }}
+QMessageBox {{ background-color: {POPUP_BG}; }}
 QMessageBox QLabel {{ color: {TEXT_PRIMARY}; background: transparent; font-size: 13px; }}
 QMessageBox QPushButton {{
-    background: {ACCENT}; color: #0A0D18; border: none; border-radius: 8px;
+    background: {ACCENT}; color: {ON_ACCENT_TEXT}; border: none; border-radius: 8px;
     padding: 6px 16px; font-size: 12px; font-weight: 600; min-width: 70px;
 }}
 QMessageBox QPushButton:hover {{ background: {ACCENT_LIGHT}; }}
@@ -222,13 +279,13 @@ def confirm_box(parent, title: str, text: str) -> bool:
 
 COMBOBOX_STYLESHEET = f"""
 QComboBox {{
-    background: rgba(255,255,255,0.05); border: 1px solid {PANEL_BORDER};
+    background: {FIELD_BG}; border: 1px solid {PANEL_BORDER};
     border-radius: 8px; padding: 6px; color: {TEXT_PRIMARY}; font-family: {FONT_DATA};
 }}
 QComboBox::drop-down {{ border: none; }}
 QComboBox QAbstractItemView {{
-    background: #10141F; color: {TEXT_PRIMARY}; border: 1px solid {PANEL_BORDER};
-    selection-background-color: {ACCENT}; selection-color: #0A0D18;
+    background: {POPUP_BG}; color: {TEXT_PRIMARY}; border: 1px solid {PANEL_BORDER};
+    selection-background-color: {ACCENT}; selection-color: {ON_ACCENT_TEXT};
     outline: none; padding: 4px;
 }}
 """
@@ -351,11 +408,12 @@ def _repeat_rate(incidents: list[Incident]) -> float:
 class GlowBackground(QWidget):
     """Центральный виджет окна — фон.
 
-    Раньше здесь было цветное радиальное свечение (тёмный фон + один яркий
-    акцент) — узнаваемый шаблон генеративных «AI-дашбордов». Заменено на
-    тихую миллиметровку: сетевые топологии и схемы черт  на сетке, а не на
-    цветном градиенте, и это единственный «фирменный» элемент фона —
-    остальное держится тихо, чтобы не спорить с данными поверх."""
+    Светлая тема, рассчитанная на целый рабочий день: холодный светло-серый
+    фон практически без декора. Едва заметная сетка (тёмный тон на пару
+    оттенков темнее фона, очень низкий альфа) — единственный «фирменный»
+    штрих, тихая отсылка к сетевым топологиям/схемам, а не цветной градиент
+    генеративных «AI-дашбордов». Лёгкое затемнение сверху-слева даёт глубину,
+    не создавая цветного пятна."""
 
     GRID_STEP = 28
 
@@ -366,7 +424,7 @@ class GlowBackground(QWidget):
         painter.fillRect(self.rect(), QColor(BG))
 
         # едва заметная сетка
-        painter.setPen(QPen(QColor(255, 255, 255, 6), 1))
+        painter.setPen(QPen(QColor(*GRID_LINE_RGBA), 1))
         for x in range(0, w, self.GRID_STEP):
             painter.drawLine(x, 0, x, h)
         for y in range(0, h, self.GRID_STEP):
@@ -375,33 +433,47 @@ class GlowBackground(QWidget):
         # очень тихая виньетка сверху-слева — глубина без цветного пятна
         painter.setRenderHint(QPainter.Antialiasing, True)
         top_tint = QColor(BG_TOP)
-        top_tint.setAlpha(90)
+        top_tint.setAlpha(VIGNETTE_ALPHA)
         vignette = QRadialGradient(w * 0.15, -h * 0.1, w * 0.9)
         vignette.setColorAt(0.0, top_tint)
         vignette.setColorAt(1.0, QColor(0, 0, 0, 0))
         painter.fillRect(self.rect(), QBrush(vignette))
 
 
+def _elevate(widget: QWidget, blur: int = 24, y_offset: int = 6, alpha: int = 26) -> None:
+    """Мягкая тень вместо тёмной стеклянной обводки — на светлом фоне именно
+    тень (не более тёмная/светлая заливка) читается как «приподнятый блок»,
+    это и есть «выделение блоками», которое просили: подложка светлее
+    страницы, тень отделяет её, а не яркая рамка."""
+    shadow = QGraphicsDropShadowEffect(widget)
+    shadow.setBlurRadius(blur)
+    shadow.setOffset(0, y_offset)
+    shadow.setColor(QColor(30, 37, 48, alpha))
+    widget.setGraphicsEffect(shadow)
+
+
 class Card(QFrame):
-    """Скруглённая карточка со стеклянной заливкой и мягкой границей."""
+    """Белая скруглённая карточка с мягкой тенью — базовый строительный блок
+    светлой темы: контент группируется через приподнятые белые панели на
+    сером фоне, а не через яркие рамки или тёмное стекло."""
 
     def __init__(self, radius: int = 18, accent_left: str | None = None):
         super().__init__()
-        border = f"border-left: 3px solid {accent_left};" if accent_left else ""
+        border = f"border-left: 3px solid {accent_left};" if accent_left else f"border: 1px solid {PANEL_BORDER};"
         self.setStyleSheet(
-            f"Card {{ background: {PANEL_BG}; border: 1px solid {PANEL_BORDER}; "
-            f"border-radius: {radius}px; {border} }}"
+            f"Card {{ background: {PANEL_BG}; border-radius: {radius}px; {border} }}"
         )
+        _elevate(self)
 
 
 class Divider(QFrame):
-    def __init__(self, vertical: bool = False):
+    def __init__(self, vertical: bool = False, color: str = PANEL_BORDER):
         super().__init__()
         self.setFrameShape(QFrame.VLine if vertical else QFrame.HLine)
         if vertical:
-            self.setStyleSheet(f"background: {PANEL_BORDER}; max-width: 1px; min-width: 1px; border: none;")
+            self.setStyleSheet(f"background: {color}; max-width: 1px; min-width: 1px; border: none;")
         else:
-            self.setStyleSheet(f"background: {PANEL_BORDER}; max-height: 1px; min-height: 1px; border: none;")
+            self.setStyleSheet(f"background: {color}; max-height: 1px; min-height: 1px; border: none;")
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +673,7 @@ class PipelineTrack(QWidget):
         for i in range(n):
             x = w * i / (n - 1) if n > 1 else 0.0
             done = x <= fill_w + 1
-            painter.setBrush(QBrush(self._color if done else QColor("#2A2F3B")))
+            painter.setBrush(QBrush(self._color if done else QColor(TRACK_BG)))
             painter.setPen(Qt.NoPen)
             painter.drawEllipse(QPointF(x, track_y + track_h / 2), 5, 5)
 
@@ -810,10 +882,10 @@ class IncidentRow(QFrame):
         self.incident = incident
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
-            f"IncidentRow {{ background: rgba(255,255,255,0.018); border: none; "
+            f"IncidentRow {{ background: {ROW_BG}; border: none; "
             f"border-left: 3px solid {incident.severity.color}; "
-            f"border-bottom: 1px solid rgba(255,255,255,0.09); }}"
-            f"IncidentRow:hover {{ background: rgba(255,255,255,0.055); }}"
+            f"border-bottom: 1px solid {PANEL_BORDER}; }}"
+            f"IncidentRow:hover {{ background: {ROW_HOVER_BG}; }}"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -848,9 +920,9 @@ class ConfigDiffRow(QFrame):
 
         self.setCursor(Qt.PointingHandCursor)
         self.setStyleSheet(
-            f"ConfigDiffRow {{ background: rgba(255,255,255,0.018); border: none; "
-            f"border-left: 3px solid {color}; border-bottom: 1px solid rgba(255,255,255,0.09); }}"
-            f"ConfigDiffRow:hover {{ background: rgba(255,255,255,0.055); }}"
+            f"ConfigDiffRow {{ background: {ROW_BG}; border: none; "
+            f"border-left: 3px solid {color}; border-bottom: 1px solid {PANEL_BORDER}; }}"
+            f"ConfigDiffRow:hover {{ background: {ROW_HOVER_BG}; }}"
         )
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 10, 14, 10)
@@ -980,7 +1052,7 @@ class ComparisonDialog(QDialog):
             QDialog {{ background: {BG}; }}
             QLabel {{ color: {TEXT_PRIMARY}; background: transparent; }}
             QTextEdit {{
-                background: rgba(255,255,255,0.03); color: {TEXT_PRIMARY};
+                background: {INSET_BG}; color: {TEXT_PRIMARY};
                 border: 1px solid {PANEL_BORDER}; border-radius: 8px; padding: 8px;
                 font-family: {FONT_DATA}; font-size: 12px;
             }}
@@ -1253,7 +1325,7 @@ class AlertsTab(QWidget):
         ))
         self.correction_edit = QTextEdit()
         self.correction_edit.setStyleSheet(
-            f"QTextEdit {{ background: rgba(255,255,255,0.03); border: 1px solid {PANEL_BORDER}; "
+            f"QTextEdit {{ background: {INSET_BG}; border: 1px solid {PANEL_BORDER}; "
             f"border-radius: 8px; padding: 8px; font-family: {FONT_TEXT}; font-size: 12px; }}"
         )
         self.correction_edit.setPlaceholderText(
@@ -1629,7 +1701,7 @@ class ConfigsTab(QWidget):
         ))
         self.correction_edit = QTextEdit()
         self.correction_edit.setStyleSheet(
-            f"QTextEdit {{ background: rgba(255,255,255,0.03); border: 1px solid {PANEL_BORDER}; "
+            f"QTextEdit {{ background: {INSET_BG}; border: 1px solid {PANEL_BORDER}; "
             f"border-radius: 8px; padding: 8px; font-family: {FONT_TEXT}; font-size: 12px; }}"
         )
         self.correction_edit.setPlaceholderText(
@@ -2015,6 +2087,31 @@ class SettingsTab(QScrollArea):
 
         root.addWidget(pg_card)
 
+        # --- Оформление ---
+        theme_card = Card(radius=18)
+        theme_layout = QVBoxLayout(theme_card)
+        theme_layout.setContentsMargins(24, 20, 24, 20)
+        theme_layout.setSpacing(10)
+        theme_layout.addWidget(_label("Оформление", size=14, weight=700))
+        theme_layout.addWidget(_label(
+            "Применяется после перезапуска приложения.",
+            size=11, color=TEXT_MUTED,
+        ))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(_label("Тема", size=12, color=TEXT_SECONDARY))
+        self.theme_combo = ComboBox()
+        self.theme_combo.addItem("Светлая", "light")
+        self.theme_combo.addItem("Тёмная", "dark")
+        self.theme_combo.setCurrentIndex(1 if CURRENT_THEME == "dark" else 0)
+        theme_row.addWidget(self.theme_combo)
+        theme_row.addStretch()
+        theme_layout.addLayout(theme_row)
+        theme_save_btn = QPushButton("Сохранить тему")
+        theme_save_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        theme_save_btn.clicked.connect(self._save_theme)
+        theme_layout.addWidget(theme_save_btn, alignment=Qt.AlignLeft)
+        root.addWidget(theme_card)
+
         card = Card(radius=18)
         form_layout = QVBoxLayout(card)
         form_layout.setContentsMargins(24, 20, 24, 20)
@@ -2181,6 +2278,16 @@ class SettingsTab(QScrollArea):
             "Параметры подключения сохранены. Перезапустите приложение — оно "
             "попробует подключиться к PostgreSQL и, если получится, перейдёт "
             "с локального SQLite на него автоматически.",
+        )
+
+    def _save_theme(self):
+        theme = self.theme_combo.currentData()
+        save_theme(theme)
+        info_box(
+            self, "Оформление",
+            "Тема сохранена. Перезапустите приложение, чтобы применить новую "
+            "палитру — она задаёт цвета и стили при старте, живого "
+            "переключения без перезапуска в приложении нет.",
         )
 
     def _save(self):
@@ -2598,7 +2705,7 @@ class GeneratorTab(QScrollArea):
         layout.addWidget(_label("Текст diff/конфига (редактируемый)", size=11, color=TEXT_SECONDARY))
         self.cfg_text_edit = QTextEdit()
         self.cfg_text_edit.setStyleSheet(
-            f"QTextEdit {{ background: rgba(255,255,255,0.03); border: 1px solid {PANEL_BORDER}; "
+            f"QTextEdit {{ background: {INSET_BG}; border: 1px solid {PANEL_BORDER}; "
             f"border-radius: 8px; padding: 10px; font-family: {FONT_DATA}; font-size: 12px; }}"
         )
         self.cfg_text_edit.setMinimumHeight(160)
@@ -3069,7 +3176,17 @@ class Sidebar(QWidget):
         self.incident_repo = incident_repo
         self.settings_manager = settings_manager
         self.setFixedWidth(268)
-        self.setStyleSheet(f"background: {SIDEBAR_BG}; border-right: 1px solid {PANEL_BORDER};")
+        # Sidebar — обычный QWidget (не QFrame/Card), а обычный QWidget как
+        # ДОЧЕРНИЙ (не top-level) виджет НЕ красит фон из стиля сам по себе —
+        # нужен явный WA_StyledBackground, иначе поверх него рисуется фон
+        # родителя (GlowBackground) и сайдбар выглядит светлым вместо тёмного
+        # графита (проверено эмпирически: без атрибута фон не применялся,
+        # хотя styleSheet() показывал верное значение).
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setObjectName("Sidebar")
+        self.setStyleSheet(
+            f"#Sidebar {{ background: {SIDEBAR_BG}; border-right: 1px solid {SIDEBAR_BORDER}; }}"
+        )
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 22, 18, 18)
@@ -3078,12 +3195,12 @@ class Sidebar(QWidget):
         brand = QHBoxLayout()
         mark = QLabel()
         mark.setFixedSize(28, 28)
-        mark.setStyleSheet(f"background: {ACCENT}; border-radius: 8px;")
+        mark.setStyleSheet(f"background: {ACCENT_LIGHT}; border-radius: 8px;")
         brand.addWidget(mark)
         brand_text = QVBoxLayout()
         brand_text.setSpacing(0)
-        brand_text.addWidget(_label("NetAI Monitor", size=13, weight=700))
-        brand_text.addWidget(_label("Псковэнергосбыт", size=10, color=TEXT_MUTED))
+        brand_text.addWidget(_label("NetAI Monitor", size=13, weight=700, color=SIDEBAR_TEXT))
+        brand_text.addWidget(_label("Псковэнергосбыт", size=10, color=SIDEBAR_TEXT_MUTED))
         brand.addLayout(brand_text)
         brand.addStretch()
         root.addLayout(brand)
@@ -3118,10 +3235,10 @@ class Sidebar(QWidget):
             self.buttons.append(btn)
         root.addLayout(nav_col)
 
-        root.addWidget(Divider())
+        root.addWidget(Divider(color=SIDEBAR_BORDER))
 
         queue_header = QHBoxLayout()
-        queue_header.addWidget(_label("Критичные", size=11, color=TEXT_SECONDARY, weight=700))
+        queue_header.addWidget(_label("Критичные", size=11, color=SIDEBAR_TEXT_SECONDARY, weight=700))
         self.queue_count_label = _label("0", size=11, color=NEGATIVE, weight=700)
         queue_header.addStretch()
         queue_header.addWidget(self.queue_count_label)
@@ -3131,9 +3248,9 @@ class Sidebar(QWidget):
         self.queue_col.setSpacing(6)
         root.addLayout(self.queue_col)
 
-        root.addWidget(Divider())
+        root.addWidget(Divider(color=SIDEBAR_BORDER))
 
-        root.addWidget(_label("Быстрый доступ", size=11, color=TEXT_SECONDARY, weight=700))
+        root.addWidget(_label("Быстрый доступ", size=11, color=SIDEBAR_TEXT_SECONDARY, weight=700))
         quick_row = QHBoxLayout()
         quick_row.setSpacing(6)
         self.quick_buttons = {}
@@ -3173,7 +3290,7 @@ class Sidebar(QWidget):
         )
         self.queue_count_label.setText(str(len(critical)))
         if not critical:
-            self.queue_col.addWidget(_label("Нет критичных инцидентов", size=10, color=TEXT_MUTED))
+            self.queue_col.addWidget(_label("Нет критичных инцидентов", size=10, color=SIDEBAR_TEXT_MUTED))
             return
         for inc in critical[:4]:
             row_widget = QWidget()
@@ -3187,8 +3304,8 @@ class Sidebar(QWidget):
             row.addWidget(dot)
             text_col = QVBoxLayout()
             text_col.setSpacing(0)
-            text_col.addWidget(_label(inc.host, size=10, weight=700, font=FONT_DATA))
-            text_col.addWidget(_label(inc.problem_name[:34], size=9, color=TEXT_MUTED))
+            text_col.addWidget(_label(inc.host, size=10, weight=700, font=FONT_DATA, color=SIDEBAR_TEXT))
+            text_col.addWidget(_label(inc.problem_name[:34], size=9, color=SIDEBAR_TEXT_MUTED))
             row.addLayout(text_col)
             self.queue_col.addWidget(row_widget)
 

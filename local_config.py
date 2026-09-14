@@ -52,3 +52,29 @@ def build_dsn(config: dict) -> str:
         f"dbname={config['dbname']} user={config['user']} "
         f"password={config['password']} host={config['host']} port={config['port']}"
     )
+
+
+def _theme_path() -> Path:
+    base = Path(os.environ.get("APPDATA", ".")) / "NetAI Monitor"
+    base.mkdir(parents=True, exist_ok=True)
+    return base / "ui_theme.json"
+
+
+def load_theme() -> str:
+    """"light" или "dark". Светлая — тема по умолчанию (см. gui.py):
+    приложение задумано как рабочий инструмент на целый день, тёмная тема —
+    осознанный выбор оператора, а не стартовое состояние."""
+    path = _theme_path()
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            theme = data.get("theme", "light")
+            return theme if theme in ("light", "dark") else "light"
+        except Exception:
+            return "light"
+    return "light"
+
+
+def save_theme(theme: str) -> None:
+    path = _theme_path()
+    path.write_text(json.dumps({"theme": theme}, ensure_ascii=False, indent=2), encoding="utf-8")
