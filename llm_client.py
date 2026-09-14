@@ -175,21 +175,28 @@ def _apply_parsed_response(incidents: List[Incident], text: str) -> None:
                 inc.ai_summary = "Не удалось разобрать формат ответа модели:"
                 inc.ai_recommendation = clean_text.strip()[:1500]
                 inc.ai_analyzed = True
-    elif parsed_any:
-        # Часть пачки распарсилась, но не вся (модель обрезала/пропустила
-        # часть пунктов) — раньше такие инциденты молча оставались без
-        # анализа (ai_analyzed=False) без единого сообщения об ошибке.
-        for inc in incidents:
-            if not inc.ai_analyzed:
-                inc.ai_summary = "Модель не вернула анализ для этого пункта в общей пачке."
-                inc.ai_recommendation = "Нажмите «Обновить и проанализировать» ещё раз — этот инцидент попадёт в новую пачку."
-                inc.ai_analyzed = True
+    # Если часть пачки не распарсилась (модель обрезала/пропустила часть
+    # пунктов) — ai_analyzed для них остаётся False. Раньше здесь сразу
+    # подставлялось сообщение-заглушка "нажмите обновить ещё раз" — но при
+    # диффовом реальном времени (см. AlertsTab) уже известные инциденты
+    # повторно не анализируются, только новые, так что заглушка оставалась
+    # НАВСЕГДА. Теперь вызывающий код (analyze()) сам ретраит недостающие
+    # пункты меньшими пачками, а AlertsTab на каждом тике повторно подаёт в
+    # анализ всё, что ещё не ai_analyzed — заглушка правда нужна только если
+    # и это не помогло (см. analyze()).
 
 
 class OllamaAnalyzer(BaseAnalyzer):
     """Единственный источник ИИ-анализа в приложении. Полностью локальный."""
 
-    BATCH_SIZE = 10
+    # Раньше было 10 — на пачке из 10 инцидентов с num_predict=1500 модель
+    # почти всегда обрезала ответ, не успев дойти до последних пунктов
+    # (кириллица заметно "дороже" в токенах, чем английский); большинство
+    # инцидентов в пачке молча оставались без анализа. Меньшая пачка + запас
+    # по num_predict (см. _call_incidents) — и есть настоящее исправление,
+    # автоматический ретай в analyze() ниже — подстраховка на случай, если
+    # даже этого не хватит.
+    BATCH_SIZE = 5
 
     def __init__(self, model: str = "gemma4:e4b", host: str = "http://localhost:11434"):
         import requests
@@ -221,33 +228,62 @@ class OllamaAnalyzer(BaseAnalyzer):
         if not incidents:
             return incidents
         for start in range(0, len(incidents), self.BATCH_SIZE):
-            batch = incidents[start:start + self.BATCH_SIZE]
-            rag_context = ""
-            if rag is not None:
-                try:
-                    # Раньше RAG-контекст строился только по batch[0].problem_name —
-                    # для остальных ~9 инцидентов в пачке подмешивались случаи, похожие
-                    # на совершенно другую проблему. Запрашиваем по всем уникальным
-                    # проблемам пачки, чтобы контекст покрывал весь батч, а не первую строку.
-                    query_text = "; ".join(dict.fromkeys(inc.problem_name for inc in batch))
-                    rag_context = rag.build_context_block(query_text)
-                except Exception:
-                    rag_context = ""
-            try:
-                self._call_incidents(_build_incident_prompt(batch, rag_context), INCIDENT_SYSTEM_PROMPT, batch)
-            except Exception as e:
-                # Раньше сюда писался сырой текст исключения вместо анализа —
-                # оператор видел Python-ошибку в поле «рекомендация». Модель
-                # была доступна на старте (is_available), но могла упасть
-                # позже (перезапуск Ollama, удалили модель, кончилось место) —
-                # откатываемся на RuleBasedAnalyzer для этой пачки вместо
-                # того, чтобы требовать перезапуск всего приложения.
-                RuleBasedAnalyzer().analyze(batch)
-                for inc in batch:
-                    inc.ai_recommendation = f"[Ollama недоступна: {e}] {inc.ai_recommendation}"
+            self._analyze_batch(incidents[start:start + self.BATCH_SIZE], rag)
         return incidents
 
+    def _analyze_batch(self, batch: List[Incident], rag, depth: int = 0) -> None:
+        rag_context = ""
+        if rag is not None:
+            try:
+                # RAG-контекст строится по всем уникальным проблемам пачки
+                # (не только по первой) — иначе для остальных подмешивались
+                # бы случаи, похожие на совсем другую проблему.
+                query_text = "; ".join(dict.fromkeys(inc.problem_name for inc in batch))
+                rag_context = rag.build_context_block(query_text)
+            except Exception:
+                rag_context = ""
+        try:
+            self._call_incidents(_build_incident_prompt(batch, rag_context), INCIDENT_SYSTEM_PROMPT, batch)
+        except Exception as e:
+            # Раньше сюда писался сырой текст исключения вместо анализа —
+            # оператор видел Python-ошибку в поле «рекомендация». Модель
+            # была доступна на старте (is_available), но могла упасть
+            # позже (перезапуск Ollama, удалили модель, кончилось место) —
+            # откатываемся на RuleBasedAnalyzer для этой пачки вместо
+            # того, чтобы требовать перезапуск всего приложения.
+            RuleBasedAnalyzer().analyze(batch)
+            for inc in batch:
+                inc.ai_recommendation = f"[Ollama недоступна: {e}] {inc.ai_recommendation}"
+            return
+
+        unanalyzed = [inc for inc in batch if not inc.ai_analyzed]
+        if not unanalyzed:
+            return
+        if len(batch) > 1 and depth < 3:
+            # Часть пачки не распарсилась — почти всегда потому, что модель
+            # обрезала ответ на длинной пачке (см. _call_incidents/done_reason)
+            # или пропустила пункт. Вместо того чтобы сразу сдаваться,
+            # повторяем именно недостающие пункты вдвое меньшей пачкой —
+            # обычно этого достаточно, чтобы модель уложилась в num_predict.
+            mid = max(1, len(unanalyzed) // 2)
+            for sub in (unanalyzed[:mid], unanalyzed[mid:]):
+                if sub:
+                    self._analyze_batch(sub, rag, depth=depth + 1)
+        else:
+            # Даже одиночный повтор не помог (или мы уже на предельной
+            # глубине ретраев) — не считаем это финальным анализом:
+            # ai_analyzed остаётся False, чтобы AlertsTab автоматически
+            # повторил попытку на следующем опросе в реальном времени, а не
+            # застрял навсегда с текстом-заглушкой (см. _apply_parsed_response).
+            for inc in unanalyzed:
+                inc.ai_summary = "Модель пока не вернула анализ для этого пункта — идёт повтор."
+                inc.ai_recommendation = "Повтор произойдёт автоматически на следующем опросе в реальном времени."
+
     def _call_incidents(self, prompt: str, system: str, batch: List[Incident]) -> None:
+        # num_predict с запасом под кириллицу (заметно "дороже" в токенах,
+        # чем английский у большинства токенайзеров) — 300 токенов на пункт
+        # пачки плюс запас, а не фиксированное число, рассчитанное на
+        # BATCH_SIZE=10 и почти всегда обрезавшее ответ раньше времени.
         response = self._requests.post(
             f"{self.host}/api/generate",
             json={
@@ -255,7 +291,7 @@ class OllamaAnalyzer(BaseAnalyzer):
                 "system": system,
                 "prompt": prompt,
                 "stream": False,
-                "options": {"num_predict": 1500, "num_ctx": 8192},
+                "options": {"num_predict": 300 * len(batch) + 400, "num_ctx": 8192},
             },
             timeout=300,
         )

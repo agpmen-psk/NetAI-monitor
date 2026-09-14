@@ -1509,9 +1509,21 @@ class AlertsTab(QWidget):
         if closed_ids:
             self.repo.mark_resolved(closed_ids)
 
-        if new_incidents:
-            analyze_worker = IncidentWorker(self.zabbix_client, self.analyzer, rag=self.rag, incidents=new_incidents)
-            analyze_worker.finished.connect(lambda incs: self._on_realtime_analyzed(analyze_worker, incs, len(closed_ids)))
+        # Инциденты, у которых предыдущая попытка анализа не распарсилась
+        # (модель обрезала ответ на длинной пачке и т.п. — см. llm_client
+        # ._analyze_batch) остаются с ai_analyzed=False именно чтобы попасть
+        # сюда и повториться автоматически, а не застрять навсегда с
+        # текстом-заглушкой. Ограничение в 20 — чтобы одна проблемная пачка
+        # не растягивала каждый последующий тик на неопределённое время.
+        retry_incidents = [i for i in self._all_incidents if not i.ai_analyzed][:20]
+        to_analyze = new_incidents + retry_incidents
+
+        if to_analyze:
+            new_ids = {i.id for i in new_incidents}
+            analyze_worker = IncidentWorker(self.zabbix_client, self.analyzer, rag=self.rag, incidents=to_analyze)
+            analyze_worker.finished.connect(
+                lambda incs: self._on_realtime_analyzed(analyze_worker, incs, new_ids, len(closed_ids))
+            )
             analyze_worker.error.connect(lambda msg: self._on_live_error(analyze_worker, msg))
             self._live_workers.append(analyze_worker)
             analyze_worker.start()
@@ -1522,17 +1534,23 @@ class AlertsTab(QWidget):
                 self.incident_added.emit()
             self._set_poll_status(new_count=0, closed_count=len(closed_ids))
 
-    def _on_realtime_analyzed(self, worker: QThread, incidents: list[Incident], closed_count: int) -> None:
+    def _on_realtime_analyzed(self, worker: QThread, incidents: list[Incident], new_ids: set[str],
+                               closed_count: int) -> None:
         if worker in self._live_workers:
             self._live_workers.remove(worker)
         self._save_and_embed(incidents)
         self._load_history()
         self.refresh_btn.setEnabled(True)
-        self._mark_unread(incidents)
+        # incidents тут — и новые, и повторно проанализированные (см.
+        # retry_incidents в _on_poll_fetched); тост/непрочитанное/статус
+        # должны отражать только реально НОВЫЕ, иначе тихий повтор ранее
+        # неудавшегося анализа выглядел бы как новый алерт.
+        new_only = [i for i in incidents if i.id in new_ids]
+        self._mark_unread(new_only)
         self.incident_added.emit()
-        self._set_poll_status(new_count=len(incidents), closed_count=closed_count)
-        if incidents:
-            self.new_realtime_alert.emit(incidents)
+        self._set_poll_status(new_count=len(new_only), closed_count=closed_count)
+        if new_only:
+            self.new_realtime_alert.emit(new_only)
 
     def _set_poll_status(self, new_count: int, closed_count: int) -> None:
         parts = []
