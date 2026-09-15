@@ -27,3 +27,7 @@ dist/
 installer_output/
 *.db
 
+
+# NSSM скачивается администратором при развёртывании (см. DEPLOYMENT.md),
+# сторонний бинарник в репозитории не нужен
+tools/nssm.exe
