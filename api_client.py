@@ -39,6 +39,17 @@ def _parse_dt(value: str | None) -> datetime | None:
     return datetime.fromisoformat(value) if value else None
 
 
+def _config_row_from_dict(d: dict) -> dict:
+    """config_diffs приходит с сервера как обычный JSON — datetime-поля
+    (saved_at) там строки ISO-8601, а не объекты datetime. gui.py (например,
+    DashboardTab._weekly_config_counts) ожидает настоящий datetime, как было
+    раньше при работе с db.ConfigDiffRepository напрямую."""
+    d = dict(d)
+    if d.get("saved_at"):
+        d["saved_at"] = _parse_dt(d["saved_at"])
+    return d
+
+
 def _incident_from_dict(d: dict) -> Incident:
     return Incident(
         id=d["id"], host=d["host"], problem_name=d["problem_name"],
@@ -169,7 +180,7 @@ class ApiConfigRepository:
         path = f"/configs?limit={limit}"
         if review_type:
             path += f"&review_type={review_type}"
-        return self.session.get(path)
+        return [_config_row_from_dict(r) for r in self.session.get(path)]
 
     def get_nodes(self) -> list[str]:
         return self.session.get("/configs/nodes")

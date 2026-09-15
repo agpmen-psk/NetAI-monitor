@@ -12,11 +12,24 @@ COLLECT ниже на EXE(..., a.binaries, a.datas, ... , onefile=True) цено
 более медленного запуска (распаковка во временную папку при каждом старте).
 """
 
+from PyInstaller.utils.hooks import collect_submodules, copy_metadata
+
+# Тонкий клиент больше не подключается к PostgreSQL/Zabbix напрямую
+# (psycopg2/pyzabbix — только на сервере, туда PyInstaller не смотрит), но
+# добавляет requests (api_client.py, HTTP до api_server.py) и keyring
+# (client_config.py, «запомнить меня» в Диспетчере учётных данных Windows).
+#
+# keyring находит свои бэкенды (в т.ч. Windows) через importlib.metadata
+# entry points своего же пакета — PyInstaller не подхватывает это
+# автоматически при статическом анализе импортов, поэтому нужны и
+# collect_submodules (сами файлы бэкендов), и copy_metadata (метаданные
+# пакета, по которым keyring их ищет). Без этого «запомнить меня» молча не
+# работал бы в собранном .exe (client_config.py перехватывает исключение),
+# хотя из исходников всё было бы в порядке.
 hiddenimports = [
-    "psycopg2",
     "openpyxl",
-    "pyzabbix",
-]
+    "requests",
+] + collect_submodules("keyring.backends")
 
 a = Analysis(
     ["main.py"],
@@ -25,6 +38,7 @@ a = Analysis(
     datas=[
         ("assets/icon.ico", "assets"),
         ("assets/fonts/*.ttf", "assets/fonts"),
+        *copy_metadata("keyring"),
     ],
     hiddenimports=hiddenimports,
     hookspath=[],
