@@ -1,4 +1,4 @@
-# install_service.ps1 — установка realtime_service.py службой Windows через NSSM.
+﻿# install_service.ps1 — установка realtime_service.py службой Windows через NSSM.
 #
 # Запускать в PowerShell ОТ АДМИНИСТРАТОРА из корня проекта:
 #     .\tools\install_service.ps1
