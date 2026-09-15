@@ -1,6 +1,6 @@
 """
 zabbix_client.py — источники данных об инцидентах.
-  - ZabbixClient      — боевой клиент через pyzabbix (event.get)
+  - ZabbixClient      — боевой клиент через pyzabbix (problem.get)
   - MockZabbixClient  — синтетический генератор для демо/защиты диплома
 
 Оба реализуют одинаковый интерфейс get_active_problems().
@@ -66,19 +66,23 @@ class ZabbixClient(BaseZabbixClient):
 
     def get_active_problems(self, limit: int = 500) -> List[Incident]:
         """
-        Использует event.get (не problem.get!) — только у event.get есть
-        параметр selectHosts, позволяющий сразу получить имя хоста.
-        source=0/object=0/value=1 — только активные триггерные проблемы,
-        этот фильтр САМ ПО СЕБЕ уже ограничивает выборку тем, что реально
-        сейчас сломано (Zabbix не может держать бесконечно много
-        одновременно активных проблем) — никакого дополнительного time_from
-        не нужно и раньше он был вреден: realtime_engine.py считает проблему
-        закрытой, если она пропала из свежего среза активных, а окно в 7
-        дней/limit=10 обрезало реально ещё активные старые/многочисленные
-        проблемы раньше, чем они закрывались в самом Zabbix — то есть
-        приложение показывало ложное «закрыто», пока авария продолжалась.
-        limit оставлен как защита от патологического объёма (не должно
-        реалистично понадобиться в честном мониторинге).
+        Использует problem.get — специализированный метод Zabbix API,
+        возвращающий РОВНО текущие нерешённые проблемы, а не событие
+        "стало PROBLEM" когда-либо в истории.
+
+        Раньше здесь стоял event.get(value=1) — это оказалось ошибочным
+        допущением: value=1 фильтрует события по их СОБСТВЕННОМУ значению
+        в момент записи ("это событие было переходом в PROBLEM"), а не по
+        тому, актуально ли это сейчас — событие разрешения (value=0)
+        записывается ОТДЕЛЬНЫМ объектом и никак не убирает старое value=1
+        событие из выборки. С time_from=7 дней это ещё маскировалось
+        (просто редкий ложный "висит открытым"/ложное автозакрытие), но
+        после убирания time_from (в попытке исправить именно эти ложные
+        срабатывания) event.get(value=1) стал сканировать ВСЮ историю
+        проблемных событий без ограничения по времени — на боевом Zabbix
+        с историей это практически зависает. problem.get не имеет такой
+        двусмысленности и не нуждается ни в каком time_from вообще: он
+        физически не может вернуть больше, чем сейчас реально сломано.
         """
         try:
             self._ensure_login()
@@ -86,38 +90,37 @@ class ZabbixClient(BaseZabbixClient):
             raise ConnectionError(f"Zabbix недоступен: {e}") from e
 
         try:
-            events = self.zapi.event.get(
+            problems = self.zapi.problem.get(
                 output="extend",
                 selectHosts=["host"],
-                selectRelatedObject=["expression"],
-                source=0,
-                object=0,
-                value=1,
-                sortfield="clock",
+                sortfield=["eventid"],
                 sortorder="DESC",
                 limit=limit,
             )
+            trigger_ids = list({p["objectid"] for p in problems if p.get("objectid")})
+            item_key_by_trigger = {}
+            if trigger_ids:
+                triggers = self.zapi.trigger.get(
+                    triggerids=trigger_ids, output=["triggerid"], selectItems=["key_"],
+                )
+                for t in triggers:
+                    items = t.get("items") or []
+                    item_key_by_trigger[t["triggerid"]] = items[0]["key_"] if items else ""
         except Exception as e:
             self.zapi = None
             raise ConnectionError(f"Zabbix недоступен: {e}") from e
 
         incidents = []
-        for ev in events:
-            host_name = ev["hosts"][0]["host"] if ev.get("hosts") else "unknown"
-            # ev["object"] — это код типа объекта фильтра event.get (для триггеров
-            # всегда "0"), а не ключ item'а — раньше сюда по ошибке попадало
-            # именно это поле, и в UI/промпте LLM для каждого инцидента
-            # показывался бессмысленный "0". selectRelatedObject возвращает
-            # выражение триггера, которое реально содержит имя хоста и ключ item'а.
-            item_key = (ev.get("relatedObject") or {}).get("expression", "")
+        for p in problems:
+            host_name = p["hosts"][0]["host"] if p.get("hosts") else "unknown"
             incidents.append(
                 Incident(
-                    id=ev["eventid"],
+                    id=p["eventid"],
                     host=host_name,
-                    problem_name=ev["name"],
-                    severity=Severity(int(ev["severity"])),
-                    timestamp=datetime.fromtimestamp(int(ev["clock"])),
-                    item_key=item_key,
+                    problem_name=p["name"],
+                    severity=Severity(int(p["severity"])),
+                    timestamp=datetime.fromtimestamp(int(p["clock"])),
+                    item_key=item_key_by_trigger.get(p.get("objectid", ""), ""),
                 )
             )
         return incidents
