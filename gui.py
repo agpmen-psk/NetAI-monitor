@@ -11,7 +11,6 @@ gui.py — интерфейс NetAI Monitor v2 с RAG.
 """
 from __future__ import annotations
 
-import copy
 import os
 import random
 import sys
@@ -33,19 +32,22 @@ from PySide6.QtWidgets import (
 )
 
 from models import Incident, Severity
-from settings import AppSettings, SettingsManager
-from db import IncidentRepository, ConfigDiffRepository
-from llm_client import OllamaAnalyzer
-# ZabbixClient/OxidizedClient здесь больше не нужны: опрос Zabbix перенесён
-# в серверную службу (realtime_service.py), а локальная проверка подключения
-# с десктопа убрана — доступ к Zabbix есть только у серверной машины.
+# Тонкий клиент: ни PostgreSQL, ни Ollama, ни Zabbix/Oxidized десктоп больше
+# не касается напрямую — всё через api_client.py (HTTP до api_server.py).
+# MockZabbixClient/MockOxidizedClient остались только как источник статичных
+# пресетов для конструктора в GeneratorTab (это просто данные, не сетевые
+# клиенты) — сама отправка идёт через очередь заданий на сервере.
 from zabbix_client import MockZabbixClient
 from mock_oxidized_client import MockOxidizedClient
-from rag import EmbeddingClient
-from local_config import (
-    load_postgres_config, save_postgres_config, build_dsn, load_theme, save_theme, DEFAULTS as PG_DEFAULTS,
+from api_client import (
+    ApiSession, ApiError, AuthError, ApiAuthClient, ApiIncidentRepository, ApiConfigRepository,
+    ApiJobsClient, ApiChatClient, ApiServiceStatusClient, ApiAdminClient,
 )
-from chat_query import build_context as build_chat_context
+from client_config import (
+    load_client_config, save_client_config, load_remembered_session,
+    save_remembered_session, clear_remembered_session,
+)
+from local_config import load_theme, save_theme
 
 # ---------------------------------------------------------------------------
 # Токены дизайна
@@ -963,33 +965,11 @@ class ConfigDiffRow(QFrame):
         layout.addWidget(summary)
 
 
-class IncidentWorker(QThread):
-    """Универсальный воркер анализа: либо тянет пачку из zabbix_client,
-    либо (если передан incidents) анализирует уже готовый список — так
-    единая логика используется и для «Обновить и проанализировать»,
-    и для отправки одного алерта из Центра генерации в реальном времени."""
-
-    finished = Signal(list)
-    error = Signal(str)
-
-    def __init__(self, zabbix_client, analyzer, rag=None, incidents: list[Incident] | None = None):
-        super().__init__()
-        self.zabbix_client = zabbix_client
-        self.analyzer = analyzer
-        self.rag = rag
-        self.incidents = incidents
-
-    def run(self):
-        try:
-            incidents = self.incidents if self.incidents is not None else self.zabbix_client.get_active_problems()
-            incidents = self.analyzer.analyze(incidents, rag=self.rag)
-            self.finished.emit(incidents)
-        except Exception as e:
-            self.error.emit(str(e))
-
-
 class ConfigTaskWorker(QThread):
-    finished = Signal(list)
+    """task_fn может вернуть что угодно — список (чтение истории из БД) или
+    словарь (результат job-задания через API), поэтому сигнал типизирован
+    как object, а не list."""
+    finished = Signal(object)
     error = Signal(str)
 
     def __init__(self, task_fn):
@@ -1147,7 +1127,7 @@ class ComparisonDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class DashboardTab(QScrollArea):
-    def __init__(self, incident_repo: IncidentRepository, config_repo: ConfigDiffRepository):
+    def __init__(self, incident_repo: ApiIncidentRepository, config_repo: ApiConfigRepository):
         super().__init__()
         self.incident_repo = incident_repo
         self.config_repo = config_repo
@@ -1306,12 +1286,10 @@ class AlertsTab(QWidget):
     # сервере), поэтому интервал можно держать коротким.
     DB_REFRESH_INTERVAL_MS = 10_000
 
-    def __init__(self, zabbix_client, analyzer, repo: IncidentRepository, rag=None):
+    def __init__(self, jobs_client: ApiJobsClient, repo: ApiIncidentRepository):
         super().__init__()
-        self.zabbix_client = zabbix_client
-        self.analyzer = analyzer
+        self.jobs_client = jobs_client
         self.repo = repo
-        self.rag = rag
         self._live_workers: list[QThread] = []
         self._compare_workers: list[QThread] = []
         self._unread_ids: set[str] = set()
@@ -1335,12 +1313,6 @@ class AlertsTab(QWidget):
 
         self.live_status_label = _label("", size=11, color=TEXT_MUTED)
         top_bar.addWidget(self.live_status_label)
-
-        rag_status = _label(
-            "RAG подключён" if self.rag else "RAG недоступен (нет nomic-embed-text)",
-            size=11, color=POSITIVE if self.rag else TEXT_MUTED, font=FONT_DATA,
-        )
-        top_bar.addWidget(rag_status)
         root.addLayout(top_bar)
 
         self._db_refresh_timer = QTimer(self)
@@ -1568,40 +1540,34 @@ class AlertsTab(QWidget):
             f"font-size: 11px; border: none; background: transparent;"
         )
 
-    def _save_and_embed(self, incidents: list[Incident]) -> None:
-        self.repo.save_incidents(incidents)
-        if self.rag is not None:
-            for inc in incidents:
-                if inc.ai_analyzed:
-                    try:
-                        self.rag.save_embedding(inc.id, inc.problem_name)
-                    except Exception:
-                        pass
-
     def submit_incident(self, incident: Incident) -> None:
-        """Принимает один синтетический инцидент из Центра генерации, анализирует
-        его в фоне и сразу добавляет в историю — «алерт в реальном времени»,
-        без ожидания следующего полного опроса Zabbix."""
+        """Принимает один синтетический инцидент из Центра генерации. Анализ,
+        сохранение и проверку на дубликат теперь делает job_worker.py на
+        сервере (задание incident_submit_external) — клиент только ставит
+        задание в очередь и ждёт результат в фоновом потоке, не блокируя UI."""
         self.live_status_label.setText(f"Получен алерт с {incident.host} — анализирую...")
         self.live_status_label.setStyleSheet(
             f"color: {WARNING}; font-size: 11px; border: none; background: transparent;"
         )
-        worker = IncidentWorker(self.zabbix_client, self.analyzer, rag=self.rag, incidents=[incident])
-        worker.finished.connect(lambda incidents: self._on_live_finished(worker, incidents))
+        payload = {
+            "id": incident.id, "host": incident.host, "problem_name": incident.problem_name,
+            "severity": incident.severity.value, "timestamp": incident.timestamp.isoformat(),
+            "item_key": incident.item_key, "last_value": incident.last_value,
+        }
+        worker = ConfigTaskWorker(lambda: self.jobs_client.run_job_blocking("incident_submit_external", payload))
+        worker.finished.connect(lambda result: self._on_live_finished(worker, incident.host, result))
         worker.error.connect(lambda msg: self._on_live_error(worker, msg))
         self._live_workers.append(worker)
         worker.start()
 
-    def _on_live_finished(self, worker: IncidentWorker, incidents: list[Incident]) -> None:
-        # Проверяем на дубликат ДО сохранения/эмбеддинга — иначе новый инцидент
-        # уже был бы в базе и находил бы сам себя с нулевой дистанцией.
-        duplicate_note = self._check_duplicate(incidents[0]) if incidents else None
-        self._save_and_embed(incidents)
+    def _on_live_finished(self, worker: QThread, host: str, result: dict) -> None:
+        if worker in self._live_workers:
+            self._live_workers.remove(worker)
         self._load_history()
         if self.list_widget.count():
             self.list_widget.setCurrentRow(0)
             self._on_select(self.list_widget.item(0))
-        host = incidents[0].host if incidents else "?"
+        duplicate_note = result.get("duplicate_note")
         if duplicate_note:
             self.live_status_label.setText(f"Алерт с {host} добавлен — {duplicate_note}")
             self.live_status_label.setStyleSheet(
@@ -1612,31 +1578,12 @@ class AlertsTab(QWidget):
             self.live_status_label.setStyleSheet(
                 f"color: {POSITIVE}; font-size: 11px; border: none; background: transparent;"
             )
-        if worker in self._live_workers:
-            self._live_workers.remove(worker)
-        self._mark_unread(incidents)
+        new_incident = next((i for i in self._all_incidents if i.id == result.get("id")), None)
+        if new_incident is not None:
+            self._mark_unread([new_incident])
         self.incident_added.emit()
-        if incidents:
-            self.new_realtime_alert.emit(incidents)
-
-    # Заметно строже общего RAG-порога релевантности (см. rag.py max_distance=0.4
-    # по умолчанию для контекста промпта) — для «это дубликат» нужна почти
-    # точная идентичность текста, а не просто тематическая похожесть.
-    DUPLICATE_MAX_DISTANCE = 0.08
-
-    def _check_duplicate(self, inc: Incident) -> str | None:
-        """Если в истории уже есть почти идентичный случай на том же хосте —
-        предупреждаем оператора, что это может быть повтор, а не новый инцидент."""
-        if self.rag is None:
-            return None
-        try:
-            similar = self.rag.find_similar(inc.problem_name, limit=3, max_distance=self.DUPLICATE_MAX_DISTANCE)
-        except Exception:
-            return None
-        for s in similar:
-            if s["host"] == inc.host:
-                return f"похоже на повтор случая «{s['problem_name']}» на {s['host']} из истории"
-        return None
+        if new_incident is not None:
+            self.new_realtime_alert.emit([new_incident])
 
     def _mark_unread(self, incidents: list[Incident]) -> None:
         """Помечает свежепроанализированные инциденты как непрочитанные — сайдбар
@@ -1700,7 +1647,7 @@ class AlertsTab(QWidget):
         self.correction_edit.setPlainText(inc.resolution)
         self.correction_edit.setEnabled(bool(inc.ai_analyzed))
         self.save_correction_btn.setEnabled(bool(inc.ai_analyzed))
-        self.compare_btn.setEnabled(bool(inc.ai_analyzed) and self.rag is not None)
+        self.compare_btn.setEnabled(bool(inc.ai_analyzed))
         self.verified_label.setText("✓ проверено инженером" if inc.ai_verified else "")
 
     def _save_correction(self):
@@ -1726,41 +1673,25 @@ class AlertsTab(QWidget):
 
     def _run_comparison(self):
         inc = self._selected_incident
-        if inc is None or self.rag is None:
+        if inc is None:
             return
         self.compare_btn.setEnabled(False)
         self.compare_btn.setText("Сравниваю...")
-        worker = ComparisonWorker(lambda: self._comparison_task(inc))
+        # Сравнение «с RAG / без RAG» теперь выполняет job_worker.py на
+        # сервере (задание rag_comparison_incident, два последовательных
+        # вызова Ollama) — клиент передаёт только id, сам инцидент сервер
+        # запрашивает заново из БД.
+        worker = ComparisonWorker(
+            lambda: self.jobs_client.run_job_blocking("rag_comparison_incident", {"incident_id": inc.id})
+        )
         worker.finished.connect(lambda result: self._on_comparison_finished(worker, result))
         worker.error.connect(lambda msg: self._on_comparison_error(worker, msg))
         # Отдельный список, НЕ _live_workers — тот используется как "занято"
-        # для 10-секундного автообновления/ручной кнопки; сравнение (два
-        # последовательных вызова Ollama) может идти десятки секунд и раньше
-        # незаметно для оператора блокировало автообновление списка на всё
-        # это время.
+        # для 10-секундного автообновления/ручной кнопки; сравнение может
+        # идти десятки секунд и раньше незаметно для оператора блокировало
+        # автообновление списка на всё это время.
         self._compare_workers.append(worker)
         worker.start()
-
-    def _comparison_task(self, inc: Incident) -> dict:
-        """Прогоняет копию инцидента через анализатор с RAG и без — оригинал
-        (и то, что видит пользователь в списке) не трогаем."""
-        inc_with = copy.deepcopy(inc)
-        inc_without = copy.deepcopy(inc)
-        self.analyzer.analyze([inc_with], rag=self.rag)
-        self.analyzer.analyze([inc_without], rag=None)
-        try:
-            rag_context = self.rag.build_context_block(inc.problem_name)
-        except Exception:
-            rag_context = ""
-        return {
-            "title": f"{inc.host}",
-            "subtitle": inc.problem_name,
-            "with_summary": inc_with.ai_summary,
-            "with_recommendation": inc_with.ai_recommendation,
-            "without_summary": inc_without.ai_summary,
-            "without_recommendation": inc_without.ai_recommendation,
-            "rag_context": rag_context,
-        }
 
     def _on_comparison_finished(self, worker: ComparisonWorker, result: dict):
         if worker in self._compare_workers:
@@ -1789,12 +1720,10 @@ class ConfigsTab(QWidget):
 
     config_added = Signal()
 
-    def __init__(self, oxidized_client, analyzer, repo: ConfigDiffRepository, rag=None):
+    def __init__(self, jobs_client: ApiJobsClient, repo: ApiConfigRepository):
         super().__init__()
-        self.oxidized_client = oxidized_client
-        self.analyzer = analyzer
+        self.jobs_client = jobs_client
         self.repo = repo
-        self.rag = rag
         self._live_workers: list[ConfigTaskWorker] = []
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
@@ -1818,11 +1747,6 @@ class ConfigsTab(QWidget):
         root.addLayout(top_bar)
 
         status_row = QHBoxLayout()
-        rag_status = _label(
-            "RAG подключён" if self.rag else "RAG недоступен (нет nomic-embed-text)",
-            size=11, color=POSITIVE if self.rag else TEXT_MUTED, font=FONT_DATA,
-        )
-        status_row.addWidget(rag_status)
         status_row.addStretch()
         self.live_status_label = _label("", size=11, color=TEXT_MUTED)
         status_row.addWidget(self.live_status_label)
@@ -1911,7 +1835,7 @@ class ConfigsTab(QWidget):
         self.device_selector.clear()
         self.device_selector.addItem(self.ALL_DEVICES)
         try:
-            for node in self.oxidized_client.get_nodes():
+            for node in self.repo.get_nodes():
                 self.device_selector.addItem(node)
         except Exception:
             pass
@@ -1951,12 +1875,12 @@ class ConfigsTab(QWidget):
         self.audit_btn.setEnabled(False)
 
         if selected == self.ALL_DEVICES:
-            task_fn = self._task_diff_all
+            task_fn = lambda: self.jobs_client.run_job_blocking("config_diff_all", {})
         else:
-            task_fn = lambda: self._task_diff_single(selected)
+            task_fn = lambda: self.jobs_client.run_job_blocking("config_diff_single", {"node": selected})
 
         worker = ConfigTaskWorker(task_fn)
-        worker.finished.connect(lambda results: self._on_finished(results, worker))
+        worker.finished.connect(lambda result: self._on_finished(result, worker))
         worker.error.connect(lambda msg: self._on_error(msg, worker))
         self._live_workers.append(worker)
         worker.start()
@@ -1976,44 +1900,11 @@ class ConfigsTab(QWidget):
         self.audit_btn.setText("Анализирую...")
         self.diff_btn.setEnabled(False)
 
-        worker = ConfigTaskWorker(lambda: self._task_full_audit(selected))
-        worker.finished.connect(lambda results: self._on_finished(results, worker))
+        worker = ConfigTaskWorker(lambda: self.jobs_client.run_job_blocking("config_full_audit", {"node": selected}))
+        worker.finished.connect(lambda result: self._on_finished(result, worker))
         worker.error.connect(lambda msg: self._on_error(msg, worker))
         self._live_workers.append(worker)
         worker.start()
-
-    def _task_diff_all(self) -> list:
-        diffs = self.oxidized_client.get_all_diffs()
-        results = []
-        for d in diffs:
-            review = self.analyzer.analyze_config_diff(d.diff_text, rag=self.rag)
-            results.append({"node": d.node, "diff_text": d.diff_text, "review_type": "diff", **review})
-        return results
-
-    def _task_diff_single(self, node: str) -> list:
-        d = self.oxidized_client.get_diff(node, "prev", "latest")
-        review = self.analyzer.analyze_config_diff(d.diff_text, rag=self.rag)
-        return [{"node": node, "diff_text": d.diff_text, "review_type": "diff", **review}]
-
-    def _task_full_audit(self, node: str) -> list:
-        config_text = self.oxidized_client.get_current_config(node)
-        review = self.analyzer.analyze_full_config(config_text, rag=self.rag)
-        return [{"node": node, "diff_text": config_text, "review_type": "full_audit", **review}]
-
-    def _save_results(self, results: list[dict]) -> None:
-        for r in results:
-            new_id = self.repo.save_diff(
-                node=r["node"], version_from="prev", version_to="latest",
-                diff_text=r["diff_text"], ai_summary=r.get("summary", ""),
-                ai_risk_level=r.get("risk_level", "UNKNOWN"),
-                ai_recommendation=r.get("recommendation", ""),
-                review_type=r.get("review_type", "diff"),
-            )
-            if self.rag is not None:
-                try:
-                    self.rag.save_embedding(new_id, r["diff_text"])
-                except Exception:
-                    pass
 
     def _reset_bulk_buttons(self):
         self.diff_btn.setEnabled(True)
@@ -2021,14 +1912,11 @@ class ConfigsTab(QWidget):
         self.audit_btn.setEnabled(True)
         self.audit_btn.setText("Полный аудит конфига")
 
-    def _on_finished(self, results, worker):
+    def _on_finished(self, result: dict, worker):
         if worker in self._live_workers:
             self._live_workers.remove(worker)
-        self._save_results(results)
         self._load_history()
-        if self.list_widget.count():
-            self.list_widget.setCurrentRow(0)
-            self._on_select(self.list_widget.item(0))
+        self._select_row_or_first(result.get("row_id"))
         self._reset_bulk_buttons()
         self.config_added.emit()
 
@@ -2038,33 +1926,41 @@ class ConfigsTab(QWidget):
         self.detail_view.setPlainText(f"Ошибка: {message}")
         self._reset_bulk_buttons()
 
-    def _task_from_external(self, node: str, review_type: str, text: str) -> list:
-        if review_type == "full_audit":
-            review = self.analyzer.analyze_full_config(text, rag=self.rag)
-        else:
-            review = self.analyzer.analyze_config_diff(text, rag=self.rag)
-        return [{"node": node, "diff_text": text, "review_type": review_type, **review}]
+    def _select_row_or_first(self, row_id) -> None:
+        """После job-задания сервер вернул либо конкретный row_id (diff по
+        одному устройству/аудит/внешняя отправка), либо только count (diff
+        по всем устройствам) — во втором случае просто открываем самую
+        свежую запись (список отсортирован по saved_at DESC)."""
+        if row_id is not None:
+            for i in range(self.list_widget.count()):
+                item = self.list_widget.item(i)
+                if item.data(Qt.UserRole).get("id") == row_id:
+                    self.list_widget.setCurrentRow(i)
+                    self._on_select(item)
+                    return
+        if self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+            self._on_select(self.list_widget.item(0))
 
     def submit_config(self, node: str, review_type: str, text: str) -> None:
-        """Принимает diff/конфиг из Центра генерации, анализирует в фоне и сразу
-        добавляет в историю проверок — без нажатия «Проверить diff»/«Аудит»."""
+        """Принимает diff/конфиг из Центра генерации — ставит задание
+        config_submit_external в очередь и сразу добавляет результат в
+        историю проверок, без нажатия «Проверить diff»/«Аудит»."""
         self.live_status_label.setText(f"Получена конфигурация {node} — анализирую...")
         self.live_status_label.setStyleSheet(
             f"color: {WARNING}; font-size: 11px; border: none; background: transparent;"
         )
-        worker = ConfigTaskWorker(lambda: self._task_from_external(node, review_type, text))
-        worker.finished.connect(lambda results: self._on_live_finished(worker, results))
+        payload = {"node": node, "review_type": review_type, "text": text}
+        worker = ConfigTaskWorker(lambda: self.jobs_client.run_job_blocking("config_submit_external", payload))
+        worker.finished.connect(lambda result: self._on_live_finished(worker, result))
         worker.error.connect(lambda msg: self._on_live_error(worker, msg))
         self._live_workers.append(worker)
         worker.start()
 
-    def _on_live_finished(self, worker: ConfigTaskWorker, results: list[dict]) -> None:
-        self._save_results(results)
+    def _on_live_finished(self, worker: ConfigTaskWorker, result: dict) -> None:
         self._load_history()
-        if self.list_widget.count():
-            self.list_widget.setCurrentRow(0)
-            self._on_select(self.list_widget.item(0))
-        node = results[0]["node"] if results else "?"
+        self._select_row_or_first(result.get("row_id"))
+        node = result.get("node", "?")
         self.live_status_label.setText(f"Конфигурация {node} проанализирована и добавлена")
         self.live_status_label.setStyleSheet(
             f"color: {POSITIVE}; font-size: 11px; border: none; background: transparent;"
@@ -2102,7 +1998,7 @@ class ConfigsTab(QWidget):
         has_analysis = bool(row.get("ai_summary"))
         self.correction_edit.setEnabled(has_analysis)
         self.save_correction_btn.setEnabled(has_analysis)
-        self.compare_btn.setEnabled(has_analysis and self.rag is not None)
+        self.compare_btn.setEnabled(has_analysis)
         self.verified_label.setText("✓ проверено инженером" if row.get("ai_verified") else "")
 
     def _save_correction(self):
@@ -2128,37 +2024,17 @@ class ConfigsTab(QWidget):
 
     def _run_comparison(self):
         row = self._selected_row
-        if row is None or self.rag is None:
+        if row is None:
             return
         self.compare_btn.setEnabled(False)
         self.compare_btn.setText("Сравниваю...")
-        worker = ComparisonWorker(lambda: self._comparison_task(row))
+        worker = ComparisonWorker(
+            lambda: self.jobs_client.run_job_blocking("rag_comparison_config", {"config_id": row["id"]})
+        )
         worker.finished.connect(lambda result: self._on_comparison_finished(worker, result))
         worker.error.connect(lambda msg: self._on_comparison_error(worker, msg))
         self._live_workers.append(worker)
         worker.start()
-
-    def _comparison_task(self, row: dict) -> dict:
-        text = row.get("diff_text") or ""
-        review_type = row.get("review_type", "diff")
-        analyze_fn = self.analyzer.analyze_full_config if review_type == "full_audit" \
-            else self.analyzer.analyze_config_diff
-        with_rag = analyze_fn(text, rag=self.rag)
-        without_rag = analyze_fn(text, rag=None)
-        try:
-            rag_context = self.rag.build_context_block(text)
-        except Exception:
-            rag_context = ""
-        return {
-            "title": row.get("node", ""),
-            "subtitle": f"риск с RAG: {with_rag.get('risk_level', '?')}  ·  "
-                        f"риск без RAG: {without_rag.get('risk_level', '?')}",
-            "with_summary": with_rag.get("summary", ""),
-            "with_recommendation": with_rag.get("recommendation", ""),
-            "without_summary": without_rag.get("summary", ""),
-            "without_recommendation": without_rag.get("recommendation", ""),
-            "rag_context": rag_context,
-        }
 
     def _on_comparison_finished(self, worker: ComparisonWorker, result: dict):
         if worker in self._live_workers:
@@ -2183,19 +2059,23 @@ class ConfigsTab(QWidget):
 class SettingsTab(QScrollArea):
     """QScrollArea (не QWidget) — карточек здесь больше, чем помещается по
     высоте на многих экранах; без прокрутки Qt сжимает layout, чтобы влезть
-    в доступную высоту, и поля визуально «плющит» друг в друга."""
+    в доступную высоту, и поля визуально «плющит» друг в друга.
 
-    def __init__(self, settings_manager: SettingsManager, on_saved=None, offline_mode: bool = False,
-                 status_repo=None):
+    Тонкий клиент: своих настроек Zabbix/Oxidized/Ollama/PostgreSQL у
+    десктопа больше нет — всё это на сервере (service_config.json), и
+    правит их отсюда только администратор, через ApiAdminClient. Инженер
+    видит только тему, статус серверных служб и свою учётную запись."""
+
+    def __init__(self, session: ApiSession, auth_result: dict, admin_client: ApiAdminClient,
+                 service_status_client: ApiServiceStatusClient, is_admin: bool, on_logout=None):
         super().__init__()
-        self.settings_manager = settings_manager
-        self.on_saved = on_saved
-        self.offline_mode = offline_mode
-        # Репозиторий heartbeat фонового сервиса — через него видно, жива ли
-        # служба на сервере и доступен ли ЕЙ Zabbix. С десктопа проверить
-        # Zabbix напрямую нельзя: туннель до него поднят только на серверной
-        # машине, поэтому локальная кнопка «Проверить» всегда врала бы.
-        self.status_repo = status_repo
+        self.session = session
+        self.admin_client = admin_client
+        self.service_status_client = service_status_client
+        self.is_admin = is_admin
+        self.on_logout = on_logout
+        self._check_workers: list[ConnectionCheckWorker] = []
+        self._users_cache: list[dict] = []
 
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -2209,75 +2089,22 @@ class SettingsTab(QScrollArea):
         root.setSpacing(16)
         self.setWidget(inner)
 
-        # --- PostgreSQL: подключение читается ДО выбора бэкенда (local_config.py),
-        # поэтому хранится отдельно от остальных настроек (app_settings живёт
-        # уже внутри выбранной БД — курица и яйцо).
-        pg_card = Card(radius=18, accent_left=(TEXT_MUTED if self.offline_mode else POSITIVE))
-        pg_layout = QVBoxLayout(pg_card)
-        pg_layout.setContentsMargins(24, 20, 24, 20)
-        pg_layout.setSpacing(10)
-
-        pg_header = QHBoxLayout()
-        pg_header.addWidget(_label("PostgreSQL", size=14, weight=700))
-        pg_header.addStretch()
-        current_storage = "сейчас: SQLite (офлайн)" if self.offline_mode else "сейчас: PostgreSQL"
-        pg_header.addWidget(_label(
-            current_storage, size=11, weight=700,
-            color=TEXT_MUTED if self.offline_mode else POSITIVE,
+        # --- Учётная запись ---
+        account_card = Card(radius=18, accent_left=POSITIVE)
+        account_layout = QVBoxLayout(account_card)
+        account_layout.setContentsMargins(24, 20, 24, 20)
+        account_layout.setSpacing(10)
+        account_layout.addWidget(_label("Учётная запись", size=14, weight=700))
+        role_ru = "администратор" if is_admin else "инженер"
+        account_layout.addWidget(_label(
+            f"{auth_result['username']}  ·  роль: {role_ru}", size=13, weight=700,
         ))
-        pg_layout.addLayout(pg_header)
-
-        pg_layout.addWidget(_label(
-            "Если PostgreSQL недоступен при запуске, приложение автоматически "
-            "работает на локальном SQLite (без RAG). Укажите параметры ниже и "
-            "сохраните, чтобы перейти на PostgreSQL — потребуется перезапуск.",
-            size=11, color=TEXT_MUTED,
-        ))
-
-        pg_config = load_postgres_config()
-        pg_form = QFormLayout()
-        pg_form.setSpacing(12)
-        self.pg_host = QLineEdit(pg_config["host"])
-        self.pg_port = QLineEdit(pg_config["port"])
-        self.pg_dbname = QLineEdit(pg_config["dbname"])
-        self.pg_user = QLineEdit(pg_config["user"])
-        self.pg_password = QLineEdit(pg_config["password"])
-        self.pg_password.setEchoMode(QLineEdit.Password)
-        for label, widget in [
-            ("Хост", self.pg_host), ("Порт", self.pg_port), ("База данных", self.pg_dbname),
-            ("Пользователь", self.pg_user), ("Пароль", self.pg_password),
-        ]:
-            pg_form.addRow(_label(label, size=12, color=TEXT_SECONDARY), widget)
-        pg_layout.addLayout(pg_form)
-
-        self.pg_default_password_warning = _label(
-            "⚠ Используются логин и пароль PostgreSQL по умолчанию (postgres/postgres) — "
-            "смените их перед вводом в эксплуатацию.",
-            size=11, color=WARNING, weight=700,
-        )
-        self.pg_default_password_warning.setWordWrap(True)
-        self.pg_default_password_warning.setVisible(
-            pg_config["user"] == PG_DEFAULTS["user"] and pg_config["password"] == PG_DEFAULTS["password"]
-        )
-        pg_layout.addWidget(self.pg_default_password_warning)
-
-        pg_action_row = QHBoxLayout()
-        pg_check_btn = QPushButton("Проверить подключение")
-        pg_check_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
-        pg_check_btn.clicked.connect(self._check_postgres_now)
-        pg_action_row.addWidget(pg_check_btn)
-
-        pg_save_btn = QPushButton("Сохранить и использовать PostgreSQL")
-        pg_save_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
-        pg_save_btn.clicked.connect(self._save_postgres_config)
-        pg_action_row.addWidget(pg_save_btn)
-        pg_action_row.addStretch()
-        pg_layout.addLayout(pg_action_row)
-
-        self.pg_status_label = _label("", size=11, color=TEXT_MUTED)
-        pg_layout.addWidget(self.pg_status_label)
-
-        root.addWidget(pg_card)
+        account_layout.addWidget(_label(f"Сервер: {session.base_url}", size=11, color=TEXT_MUTED, font=FONT_DATA))
+        logout_btn = QPushButton("Выйти из системы")
+        logout_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        logout_btn.clicked.connect(lambda: self.on_logout() if self.on_logout else None)
+        account_layout.addWidget(logout_btn, alignment=Qt.AlignLeft)
+        root.addWidget(account_card)
 
         # --- Оформление ---
         theme_card = Card(radius=18)
@@ -2306,333 +2133,27 @@ class SettingsTab(QScrollArea):
 
         root.addWidget(self._build_service_status_card())
 
-        settings = self.settings_manager.load()
+        if is_admin:
+            root.addWidget(self._build_server_config_card())
+            root.addWidget(self._build_users_card())
+        else:
+            note_card = Card(radius=18)
+            note_layout = QVBoxLayout(note_card)
+            note_layout.setContentsMargins(24, 20, 24, 20)
+            note_layout.setSpacing(6)
+            note_layout.addWidget(_label("Серверные настройки и пользователи", size=14, weight=700))
+            note_layout.addWidget(_label(
+                "Параметры Zabbix/Oxidized/Ollama и управление учётными записями "
+                "доступны только администратору.",
+                size=11, color=TEXT_MUTED,
+            ))
+            root.addWidget(note_card)
 
-        # --- Серверные параметры (только для чтения) ---
-        # Zabbix доступен только серверной машине (туннель поднят на ней), а
-        # значит задавать его с произвольного десктопа бессмысленно: опрос
-        # всё равно выполняет служба со своими настройками из
-        # service_config.json. Здесь показываем их, чтобы было видно, с чем
-        # работает сервис, но менять предлагаем там, где это действительно
-        # применяется.
-        server_card = Card(radius=18)
-        server_layout = QVBoxLayout(server_card)
-        server_layout.setContentsMargins(24, 20, 24, 20)
-        server_layout.setSpacing(10)
-        server_layout.addWidget(_label("Источники данных (настраиваются на сервере)", size=14, weight=700))
-        server_layout.addWidget(_label(
-            "Опрос Zabbix выполняет фоновая служба на сервере — только у неё есть "
-            "доступ к Zabbix (через туннель). Эти параметры задаются в файле "
-            "service_config.json на сервере и показаны здесь только для справки.",
-            size=11, color=TEXT_MUTED,
-        ))
-        server_form = QFormLayout()
-        server_form.setSpacing(12)
-        self.zabbix_url = QLineEdit(settings.zabbix_url)
-        self.zabbix_user = QLineEdit(settings.zabbix_user)
-        self.zabbix_password = QLineEdit(settings.zabbix_password)
-        self.zabbix_password.setEchoMode(QLineEdit.Password)
-        self.oxidized_url = QLineEdit(settings.oxidized_url)
-        for label, widget in [
-            ("Zabbix URL", self.zabbix_url),
-            ("Zabbix логин", self.zabbix_user),
-            ("Zabbix пароль", self.zabbix_password),
-            ("Oxidized URL", self.oxidized_url),
-        ]:
-            widget.setReadOnly(True)
-            widget.setStyleSheet(
-                f"QLineEdit {{ background: {INSET_BG}; border: 1px solid {PANEL_BORDER}; "
-                f"border-radius: 8px; padding: 8px; color: {TEXT_MUTED}; "
-                f"font-family: {FONT_DATA}; font-size: 12px; }}"
-            )
-            server_form.addRow(_label(label, size=12, color=TEXT_SECONDARY), widget)
-        server_layout.addLayout(server_form)
-        root.addWidget(server_card)
-
-        # --- Параметры этого клиента (редактируемые) ---
-        # Ollama у каждого клиента своя по адресу: для службы это localhost
-        # сервера, для десктопов — IP того же сервера в локальной сети.
-        card = Card(radius=18)
-        form_layout = QVBoxLayout(card)
-        form_layout.setContentsMargins(24, 20, 24, 20)
-        form_layout.setSpacing(10)
-        form_layout.addWidget(_label("Ollama для этого приложения", size=14, weight=700))
-        form_layout.addWidget(_label(
-            "Используется чатом, анализом конфигураций и сравнением «с RAG / без RAG» "
-            "в этом приложении. Укажите адрес сервера, где запущена Ollama.",
-            size=11, color=TEXT_MUTED,
-        ))
-        form = QFormLayout()
-        form.setSpacing(12)
-
-        self.ollama_host = QLineEdit(settings.ollama_host)
-        self.ollama_model = QLineEdit(settings.ollama_model)
-        self.embedding_model = QLineEdit(settings.embedding_model)
-
-        for label, widget in [
-            ("Ollama host", self.ollama_host),
-            ("Ollama модель", self.ollama_model),
-            ("Модель эмбеддингов (RAG)", self.embedding_model),
-        ]:
-            lbl = _label(label, size=12, color=TEXT_SECONDARY)
-            form.addRow(lbl, widget)
-
-        form_layout.addLayout(form)
-        root.addWidget(card)
-
-        save_btn = QPushButton("Сохранить настройки")
-        save_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
-        save_btn.clicked.connect(self._save)
-        root.addWidget(save_btn, alignment=Qt.AlignLeft)
-
-        root.addWidget(_label("Изменения применяются после перезапуска приложения.", size=11, color=TEXT_MUTED))
-
-        # --- Проверка подключений ---
-        # Zabbix/Oxidized здесь сознательно НЕТ: проверять их с десктопа
-        # бессмысленно — доступ к ним есть только у серверной машины с
-        # туннелем, и локальная проверка всегда показывала бы «недоступно»
-        # даже при полностью здоровой системе. Их состояние берётся из
-        # heartbeat службы (карточка «Сервис реального времени» выше).
-        check_card = Card(radius=18)
-        check_layout = QVBoxLayout(check_card)
-        check_layout.setContentsMargins(24, 20, 24, 20)
-        check_layout.setSpacing(10)
-        check_layout.addWidget(_label("Проверка подключений с этого компьютера", size=14, weight=700))
-        check_layout.addWidget(_label(
-            "Проверяет доступность по текущим значениям полей выше (даже если ещё не сохранены). "
-            "Состояние Zabbix смотрите в карточке «Сервис реального времени» — его опрашивает сервер.",
-            size=11, color=TEXT_MUTED,
-        ))
-
-        self._check_workers: list[ConnectionCheckWorker] = []
-        self._check_rows: dict[str, tuple[QLabel, QPushButton]] = {}
-        services = [
-            ("ollama", "Ollama (модель анализа)", self._check_ollama),
-            ("embedding", "Ollama (модель эмбеддингов / RAG)", self._check_embedding),
-        ]
-        for key, label, check_fn in services:
-            row = QHBoxLayout()
-            row.addWidget(_label(label, size=12, font=FONT_DATA), stretch=1)
-            status_label = _label("не проверено", size=11, color=TEXT_MUTED)
-            row.addWidget(status_label)
-            check_btn = QPushButton("Проверить")
-            check_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
-            check_btn.clicked.connect(lambda _, k=key, fn=check_fn: self._run_check(k, fn))
-            row.addWidget(check_btn)
-            check_layout.addLayout(row)
-            self._check_rows[key] = (status_label, check_btn)
-
-        root.addWidget(check_card)
         root.addStretch()
-
-    # Сколько времени без обновления heartbeat считать службу «не
-    # отвечающей». Три пропущенных минутных цикла: не реагирует на один
-    # затянувшийся опрос, но быстро заметит реальное падение. Статус
-    # 'analyzing' из этого правила исключён — длинный LLM-прогон это
-    # нормальная работа, а не признак смерти (см. _refresh_service_status).
-    SERVICE_STALE_SECONDS = 180
-
-    def _build_service_status_card(self) -> Card:
-        card = Card(radius=18)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(8)
-
-        header = QHBoxLayout()
-        header.addWidget(_label("Сервис реального времени", size=14, weight=700))
-        header.addStretch()
-        refresh_btn = QPushButton("Обновить")
-        refresh_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
-        refresh_btn.clicked.connect(self._refresh_service_status)
-        header.addWidget(refresh_btn)
-        layout.addLayout(header)
-
-        layout.addWidget(_label(
-            "Опрос Zabbix и анализ через LLM выполняет фоновая служба на сервере — "
-            "независимо от того, открыто ли это приложение (см. realtime_service.py).",
-            size=11, color=TEXT_MUTED,
-        ))
-
-        self.service_state_label = _label("состояние: нет данных", size=12, weight=700, color=TEXT_MUTED)
-        layout.addWidget(self.service_state_label)
-        self.service_detail_label = _label("", size=11, color=TEXT_SECONDARY)
-        self.service_detail_label.setWordWrap(True)
-        layout.addWidget(self.service_detail_label)
-        self.service_zabbix_label = _label("", size=11, color=TEXT_SECONDARY, font=FONT_DATA)
-        self.service_zabbix_label.setWordWrap(True)
-        layout.addWidget(self.service_zabbix_label)
-
-        self._refresh_service_status()
-        return card
-
-    def _refresh_service_status(self) -> None:
-        if self.status_repo is None:
-            self._set_service_state("состояние: неизвестно", TEXT_MUTED,
-                                     "Нет подключения к общей БД — статус службы недоступен.", "")
-            return
-        try:
-            row = self.status_repo.read()
-        except Exception as e:
-            self._set_service_state("состояние: ошибка чтения", NEGATIVE, str(e)[:200], "")
-            return
-
-        if not row:
-            self._set_service_state(
-                "состояние: служба ни разу не запускалась", WARNING,
-                "В общей БД нет ни одной отметки от службы. Запустите realtime_service.py "
-                "на сервере (см. DEPLOYMENT.md) — без неё новые алерты из Zabbix не появятся.",
-                "",
-            )
-            return
-
-        updated_at = row.get("updated_at")
-        status = (row.get("status") or "").lower()
-        age_seconds = (datetime.now() - updated_at).total_seconds() if updated_at else None
-        stale = age_seconds is not None and age_seconds > self.SERVICE_STALE_SECONDS
-
-        if status == "stopped":
-            state_text, color = "состояние: остановлена", WARNING
-        elif status == "error":
-            state_text, color = "состояние: ошибка в цикле опроса", NEGATIVE
-        elif status == "analyzing":
-            # Длинный LLM-прогон — штатная работа, даже если отметка «старая».
-            state_text, color = "состояние: идёт анализ через LLM", POSITIVE
-        elif stale:
-            state_text, color = "состояние: не отвечает", NEGATIVE
-        else:
-            state_text, color = "состояние: работает", POSITIVE
-
-        parts = []
-        if row.get("message"):
-            parts.append(row["message"])
-        if updated_at:
-            parts.append(f"отметка {_relative_time(updated_at)}")
-        if row.get("last_poll_at"):
-            parts.append(f"последний опрос {_relative_time(row['last_poll_at'])}")
-        parts.append(
-            f"за последний цикл: новых {row.get('last_new') or 0}, "
-            f"закрыто {row.get('last_closed') or 0}, повтор {row.get('last_retried') or 0}"
-        )
-        if row.get("service_host"):
-            parts.append(f"сервер: {row['service_host']}")
-        detail = " · ".join(parts)
-        if stale and status != "analyzing":
-            detail += (
-                f"\nОтметки нет дольше {self.SERVICE_STALE_SECONDS // 60} мин — проверьте службу "
-                "на сервере (services.msc) и её лог realtime.log."
-            )
-
-        zabbix_ok = row.get("zabbix_ok")
-        if zabbix_ok is None:
-            zabbix_text = "Zabbix: статус ещё не определён"
-        elif zabbix_ok:
-            zabbix_text = "Zabbix: доступен серверу ✓"
-        else:
-            zabbix_text = f"Zabbix: недоступен серверу ✗ — {row.get('zabbix_message') or 'без подробностей'}"
-
-        self._set_service_state(state_text, color, detail, zabbix_text,
-                                 zabbix_ok=zabbix_ok)
-
-    def _set_service_state(self, state_text: str, color: str, detail: str, zabbix_text: str,
-                            zabbix_ok=None) -> None:
-        self.service_state_label.setText(state_text)
-        self.service_state_label.setStyleSheet(
-            f"color: {color}; font-size: 12px; font-weight: 700; border: none; background: transparent;"
-        )
-        self.service_detail_label.setText(detail)
-        self.service_zabbix_label.setText(zabbix_text)
-        zabbix_color = TEXT_SECONDARY if zabbix_ok is None else (POSITIVE if zabbix_ok else NEGATIVE)
-        self.service_zabbix_label.setStyleSheet(
-            f"color: {zabbix_color}; font-size: 11px; font-family: {FONT_DATA}; "
-            f"border: none; background: transparent;"
-        )
 
     def _shutdown(self) -> None:
         for worker in self._check_workers:
             _disconnect_worker(worker)
-
-    def _run_check(self, key: str, check_fn) -> None:
-        status_label, check_btn = self._check_rows[key]
-        check_btn.setEnabled(False)
-        status_label.setText("проверяю...")
-        status_label.setStyleSheet(f"color: {WARNING}; font-size: 11px; border: none; background: transparent;")
-        worker = ConnectionCheckWorker(check_fn)
-        worker.finished.connect(lambda ok, msg: self._on_check_finished(worker, key, ok, msg))
-        self._check_workers.append(worker)
-        worker.start()
-
-    def _on_check_finished(self, worker: ConnectionCheckWorker, key: str, ok: bool, message: str) -> None:
-        if worker in self._check_workers:
-            self._check_workers.remove(worker)
-        status_label, check_btn = self._check_rows[key]
-        status_label.setText(("✓ " if ok else "✗ ") + (message or ("ок" if ok else "недоступно")))
-        status_label.setStyleSheet(
-            f"color: {POSITIVE if ok else NEGATIVE}; font-size: 11px; border: none; background: transparent;"
-        )
-        check_btn.setEnabled(True)
-
-    def _check_ollama(self):
-        try:
-            analyzer = OllamaAnalyzer(model=self.ollama_model.text(), host=self.ollama_host.text())
-            ok = analyzer.is_available()
-            return ok, ("модель доступна" if ok else "сервер отвечает, но модель не скачана (ollama pull)")
-        except Exception as e:
-            return False, str(e)[:150]
-
-    def _check_embedding(self):
-        try:
-            client = EmbeddingClient(host=self.ollama_host.text(), model=self.embedding_model.text())
-            ok = client.is_available()
-            return ok, ("модель доступна" if ok else "не отвечает или модель не скачана")
-        except Exception as e:
-            return False, str(e)[:150]
-
-    def _current_pg_config(self) -> dict:
-        return {
-            "host": self.pg_host.text().strip() or "localhost",
-            "port": self.pg_port.text().strip() or "5432",
-            "dbname": self.pg_dbname.text().strip() or "netai_monitor",
-            "user": self.pg_user.text().strip() or "postgres",
-            "password": self.pg_password.text(),
-        }
-
-    def _check_postgres(self):
-        try:
-            import psycopg2
-            conn = psycopg2.connect(build_dsn(self._current_pg_config()), connect_timeout=5)
-            conn.close()
-            return True, "подключение успешно"
-        except Exception as e:
-            return False, str(e)[:150]
-
-    def _check_postgres_now(self):
-        self.pg_status_label.setText("проверяю...")
-        self.pg_status_label.setStyleSheet(f"color: {WARNING}; font-size: 11px; border: none; background: transparent;")
-        worker = ConnectionCheckWorker(self._check_postgres)
-        worker.finished.connect(lambda ok, msg: self._on_postgres_check_finished(worker, ok, msg))
-        self._check_workers.append(worker)
-        worker.start()
-
-    def _on_postgres_check_finished(self, worker, ok: bool, message: str) -> None:
-        if worker in self._check_workers:
-            self._check_workers.remove(worker)
-        self.pg_status_label.setText(("✓ " if ok else "✗ ") + message)
-        self.pg_status_label.setStyleSheet(
-            f"color: {POSITIVE if ok else NEGATIVE}; font-size: 11px; border: none; background: transparent;"
-        )
-
-    def _save_postgres_config(self):
-        config = self._current_pg_config()
-        save_postgres_config(config)
-        self.pg_default_password_warning.setVisible(
-            config["user"] == PG_DEFAULTS["user"] and config["password"] == PG_DEFAULTS["password"]
-        )
-        info_box(
-            self, "PostgreSQL",
-            "Параметры подключения сохранены. Перезапустите приложение — оно "
-            "попробует подключиться к PostgreSQL и, если получится, перейдёт "
-            "с локального SQLite на него автоматически.",
-        )
 
     def _save_theme(self):
         theme = self.theme_combo.currentData()
@@ -2644,27 +2165,327 @@ class SettingsTab(QScrollArea):
             "переключения без перезапуска в приложении нет.",
         )
 
-    def _save(self):
-        # Серверные поля (Zabbix/Oxidized) берём из БД заново, а НЕ из
-        # показанных полей: они только для чтения, и их мог только что
-        # обновить сервис из своего service_config.json — сохранять поверх
-        # то, что было отрисовано при открытии окна, значило бы затирать
-        # свежие серверные значения устаревшей копией.
-        current = self.settings_manager.load()
-        settings = AppSettings(
-            zabbix_url=current.zabbix_url,
-            zabbix_user=current.zabbix_user,
-            zabbix_password=current.zabbix_password,
-            oxidized_url=current.oxidized_url,
-            ollama_host=self.ollama_host.text(),
-            ollama_model=self.ollama_model.text(),
-            embedding_model=self.embedding_model.text(),
-            use_synthetic_data=current.use_synthetic_data,
+    # -- Статус серверных служб ------------------------------------------------
+
+    # Сколько времени без обновления heartbeat считать службу «не
+    # отвечающей». Три пропущенных минутных цикла: не реагирует на один
+    # затянувшийся опрос, но быстро заметит реальное падение. Статусы
+    # 'analyzing'/'running' из этого правила исключены — длинный LLM-прогон
+    # это нормальная работа, а не признак смерти.
+    SERVICE_STALE_SECONDS = 180
+
+    def _build_service_status_card(self) -> Card:
+        card = Card(radius=18)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        header.addWidget(_label("Серверные службы", size=14, weight=700))
+        header.addStretch()
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        refresh_btn.clicked.connect(self._refresh_service_status)
+        header.addWidget(refresh_btn)
+        layout.addLayout(header)
+
+        layout.addWidget(_label(
+            "Опрос Zabbix и обработка очереди LLM-заданий выполняются двумя "
+            "независимыми фоновыми службами на сервере — независимо от того, "
+            "открыто ли это приложение (см. realtime_service.py / job_worker.py).",
+            size=11, color=TEXT_MUTED,
+        ))
+
+        self._service_labels: dict[str, tuple[QLabel, QLabel]] = {}
+        for key, title in (("realtime", "Опрос Zabbix"), ("job_worker", "Очередь LLM-заданий")):
+            layout.addWidget(_label(title, size=12, color=TEXT_SECONDARY, weight=700))
+            state_label = _label("состояние: нет данных", size=12, weight=700, color=TEXT_MUTED)
+            layout.addWidget(state_label)
+            detail_label = _label("", size=11, color=TEXT_SECONDARY)
+            detail_label.setWordWrap(True)
+            layout.addWidget(detail_label)
+            self._service_labels[key] = (state_label, detail_label)
+
+        self._refresh_service_status()
+        return card
+
+    def _refresh_service_status(self) -> None:
+        try:
+            status = self.service_status_client.read_all()
+        except ApiError as e:
+            for state_label, detail_label in self._service_labels.values():
+                self._set_service_state(state_label, detail_label, "состояние: ошибка чтения", NEGATIVE, str(e))
+            return
+        for key in ("realtime", "job_worker"):
+            self._render_service(key, status.get(key) or {})
+
+    def _render_service(self, key: str, row: dict) -> None:
+        state_label, detail_label = self._service_labels[key]
+        if not row:
+            self._set_service_state(
+                state_label, detail_label, "состояние: служба ни разу не запускалась", WARNING,
+                "Нет ни одной отметки от службы — проверьте, что она запущена на сервере (см. DEPLOYMENT.md).",
+            )
+            return
+
+        updated_at_raw = row.get("updated_at")
+        updated_at = datetime.fromisoformat(updated_at_raw) if updated_at_raw else None
+        status = (row.get("status") or "").lower()
+        age_seconds = (datetime.now() - updated_at).total_seconds() if updated_at else None
+        stale = age_seconds is not None and age_seconds > self.SERVICE_STALE_SECONDS
+        busy_statuses = ("analyzing", "running", "polling")
+
+        if status == "stopped":
+            state_text, color = "состояние: остановлена", WARNING
+        elif status == "error":
+            state_text, color = "состояние: ошибка", NEGATIVE
+        elif status in busy_statuses:
+            state_text, color = "состояние: выполняет работу", POSITIVE
+        elif stale:
+            state_text, color = "состояние: не отвечает", NEGATIVE
+        else:
+            state_text, color = "состояние: работает", POSITIVE
+
+        parts = []
+        if row.get("message"):
+            parts.append(row["message"])
+        if updated_at:
+            parts.append(f"отметка {_relative_time(updated_at)}")
+        if row.get("last_poll_at"):
+            parts.append(f"последний опрос {_relative_time(datetime.fromisoformat(row['last_poll_at']))}")
+        if key == "realtime" and row.get("zabbix_ok") is not None:
+            parts.append("Zabbix доступен" if row["zabbix_ok"] else f"Zabbix недоступен ({row.get('zabbix_message') or '?'})")
+        if row.get("service_host"):
+            parts.append(f"сервер: {row['service_host']}")
+        detail = " · ".join(parts)
+        if stale and status not in busy_statuses:
+            detail += f"\nОтметки нет дольше {self.SERVICE_STALE_SECONDS // 60} мин — проверьте службу на сервере."
+
+        self._set_service_state(state_label, detail_label, state_text, color, detail)
+
+    @staticmethod
+    def _set_service_state(state_label: QLabel, detail_label: QLabel, state_text: str, color: str, detail: str) -> None:
+        state_label.setText(state_text)
+        state_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: 700; border: none; background: transparent;"
         )
-        self.settings_manager.save(settings)
-        info_box(self, "Настройки", "Сохранено. Перезапустите приложение для применения.")
-        if self.on_saved:
-            self.on_saved()
+        detail_label.setText(detail)
+
+    # -- Серверные настройки (только admin) ------------------------------------
+
+    def _build_server_config_card(self) -> Card:
+        card = Card(radius=18)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+        layout.addWidget(_label("Настройки сервера", size=14, weight=700))
+        layout.addWidget(_label(
+            "Хранятся в service_config.json на сервере и используются всеми тремя "
+            "серверными процессами. Изменения применятся после перезапуска служб там.",
+            size=11, color=TEXT_MUTED,
+        ))
+
+        form = QFormLayout()
+        form.setSpacing(10)
+        self.cfg_zabbix_url = QLineEdit()
+        self.cfg_zabbix_user = QLineEdit()
+        self.cfg_zabbix_password = QLineEdit()
+        self.cfg_zabbix_password.setEchoMode(QLineEdit.Password)
+        self.cfg_oxidized_url = QLineEdit()
+        self.cfg_ollama_host = QLineEdit()
+        self.cfg_ollama_model = QLineEdit()
+        self.cfg_embedding_model = QLineEdit()
+        self.cfg_poll_interval = QLineEdit()
+        self.cfg_synthetic_checkbox = QCheckBox("Синтетические данные (демо-режим)")
+        for label, widget in [
+            ("Zabbix URL", self.cfg_zabbix_url), ("Zabbix логин", self.cfg_zabbix_user),
+            ("Zabbix пароль", self.cfg_zabbix_password), ("Oxidized URL", self.cfg_oxidized_url),
+            ("Ollama host", self.cfg_ollama_host), ("Ollama модель", self.cfg_ollama_model),
+            ("Модель эмбеддингов (RAG)", self.cfg_embedding_model),
+            ("Интервал опроса Zabbix, сек", self.cfg_poll_interval),
+        ]:
+            form.addRow(_label(label, size=12, color=TEXT_SECONDARY), widget)
+        layout.addLayout(form)
+        layout.addWidget(self.cfg_synthetic_checkbox)
+
+        btn_row = QHBoxLayout()
+        reload_btn = QPushButton("Обновить из сервера")
+        reload_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        reload_btn.clicked.connect(self._load_server_config)
+        btn_row.addWidget(reload_btn)
+        save_btn = QPushButton("Сохранить настройки сервера")
+        save_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
+        save_btn.clicked.connect(self._save_server_config)
+        btn_row.addWidget(save_btn)
+        btn_row.addStretch()
+        layout.addLayout(btn_row)
+
+        self.server_config_status = _label("", size=11, color=TEXT_MUTED)
+        self.server_config_status.setWordWrap(True)
+        layout.addWidget(self.server_config_status)
+
+        self._load_server_config()
+        return card
+
+    def _load_server_config(self) -> None:
+        try:
+            config = self.admin_client.get_service_config()
+        except ApiError as e:
+            self.server_config_status.setText(f"Не удалось загрузить: {e}")
+            self.server_config_status.setStyleSheet(f"color: {NEGATIVE}; font-size: 11px; border: none; background: transparent;")
+            return
+        self.cfg_zabbix_url.setText(config.get("zabbix_url", ""))
+        self.cfg_zabbix_user.setText(config.get("zabbix_user", ""))
+        self.cfg_zabbix_password.setText("")  # маскировано сервером — не перезаписываем пустым, если не меняли
+        self.cfg_oxidized_url.setText(config.get("oxidized_url", ""))
+        self.cfg_ollama_host.setText(config.get("ollama_host", ""))
+        self.cfg_ollama_model.setText(config.get("ollama_model", ""))
+        self.cfg_embedding_model.setText(config.get("embedding_model", ""))
+        self.cfg_poll_interval.setText(str(config.get("poll_interval_seconds", 60)))
+        self.cfg_synthetic_checkbox.setChecked(bool(config.get("use_synthetic_data")))
+        self.server_config_status.setText("Загружено с сервера.")
+        self.server_config_status.setStyleSheet(f"color: {TEXT_MUTED}; font-size: 11px; border: none; background: transparent;")
+
+    def _save_server_config(self) -> None:
+        updates = {
+            "zabbix_url": self.cfg_zabbix_url.text().strip(),
+            "zabbix_user": self.cfg_zabbix_user.text().strip(),
+            "oxidized_url": self.cfg_oxidized_url.text().strip(),
+            "ollama_host": self.cfg_ollama_host.text().strip(),
+            "ollama_model": self.cfg_ollama_model.text().strip(),
+            "embedding_model": self.cfg_embedding_model.text().strip(),
+            "use_synthetic_data": self.cfg_synthetic_checkbox.isChecked(),
+        }
+        try:
+            updates["poll_interval_seconds"] = int(self.cfg_poll_interval.text().strip() or "60")
+        except ValueError:
+            warn_box(self, "Неверное значение", "Интервал опроса должен быть целым числом секунд.")
+            return
+        # Пароль отправляем, только если инженер его действительно ввёл —
+        # пустое поле означает «не менять» (сервер сам маскирует пароль
+        # маркером ••• при чтении, см. GET /admin/service-config).
+        if self.cfg_zabbix_password.text():
+            updates["zabbix_password"] = self.cfg_zabbix_password.text()
+        try:
+            self.admin_client.update_service_config(updates)
+        except ApiError as e:
+            warn_box(self, "Ошибка сохранения", str(e))
+            return
+        info_box(self, "Настройки сервера", "Сохранено. Перезапустите серверные службы, чтобы применить.")
+        self._load_server_config()
+
+    # -- Пользователи (только admin) --------------------------------------------
+
+    def _build_users_card(self) -> Card:
+        card = Card(radius=18)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(10)
+        layout.addWidget(_label("Пользователи", size=14, weight=700))
+
+        self.users_col = QVBoxLayout()
+        self.users_col.setSpacing(6)
+        layout.addLayout(self.users_col)
+
+        layout.addWidget(Divider())
+        layout.addWidget(_label("Новый пользователь", size=12, weight=700))
+        form = QFormLayout()
+        form.setSpacing(8)
+        self.new_user_login = QLineEdit()
+        self.new_user_password = QLineEdit()
+        self.new_user_password.setEchoMode(QLineEdit.Password)
+        self.new_user_role = ComboBox()
+        self.new_user_role.addItem("Инженер", "engineer")
+        self.new_user_role.addItem("Администратор", "admin")
+        form.addRow(_label("Логин", size=12, color=TEXT_SECONDARY), self.new_user_login)
+        form.addRow(_label("Пароль", size=12, color=TEXT_SECONDARY), self.new_user_password)
+        form.addRow(_label("Роль", size=12, color=TEXT_SECONDARY), self.new_user_role)
+        layout.addLayout(form)
+
+        create_btn = QPushButton("Создать пользователя")
+        create_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
+        create_btn.clicked.connect(self._create_user)
+        layout.addWidget(create_btn, alignment=Qt.AlignLeft)
+
+        self.users_status = _label("", size=11, color=TEXT_MUTED)
+        self.users_status.setWordWrap(True)
+        layout.addWidget(self.users_status)
+
+        self._load_users()
+        return card
+
+    def _load_users(self) -> None:
+        try:
+            self._users_cache = self.admin_client.list_users()
+        except ApiError as e:
+            self.users_status.setText(f"Не удалось загрузить список: {e}")
+            return
+        _clear_layout(self.users_col)
+        for user in self._users_cache:
+            row_widget = QWidget()
+            row_widget.setStyleSheet("background: transparent;")
+            row = QHBoxLayout(row_widget)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(8)
+            state_color = TEXT_PRIMARY if user["is_active"] else TEXT_MUTED
+            row.addWidget(_label(
+                f"{user['username']}  ·  {user['role']}" + ("" if user["is_active"] else "  (отключён)"),
+                size=12, color=state_color, font=FONT_DATA,
+            ), stretch=1)
+
+            toggle_btn = QPushButton("Отключить" if user["is_active"] else "Включить")
+            toggle_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+            toggle_btn.clicked.connect(lambda _, u=user: self._toggle_user_active(u))
+            row.addWidget(toggle_btn)
+
+            reset_btn = QPushButton("Сбросить пароль")
+            reset_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+            reset_btn.clicked.connect(lambda _, u=user: self._reset_user_password(u))
+            row.addWidget(reset_btn)
+
+            self.users_col.addWidget(row_widget)
+
+    def _toggle_user_active(self, user: dict) -> None:
+        try:
+            self.admin_client.set_user_active(user["id"], not user["is_active"])
+        except ApiError as e:
+            warn_box(self, "Ошибка", str(e))
+            return
+        self._load_users()
+
+    def _reset_user_password(self, user: dict) -> None:
+        from PySide6.QtWidgets import QInputDialog
+        password, ok = QInputDialog.getText(
+            self, "Сброс пароля", f"Новый пароль для {user['username']} (мин. 8 символов):",
+            QLineEdit.Password,
+        )
+        if not ok or not password:
+            return
+        try:
+            self.admin_client.reset_user_password(user["id"], password)
+        except ApiError as e:
+            warn_box(self, "Ошибка", str(e))
+            return
+        info_box(self, "Пароль изменён", f"Новый пароль для {user['username']} сохранён.")
+
+    def _create_user(self) -> None:
+        username = self.new_user_login.text().strip()
+        password = self.new_user_password.text()
+        role = self.new_user_role.currentData()
+        if not username or not password:
+            self.users_status.setText("Заполните логин и пароль.")
+            return
+        try:
+            self.admin_client.create_user(username, password, role=role)
+        except ApiError as e:
+            self.users_status.setText(str(e))
+            self.users_status.setStyleSheet(f"color: {NEGATIVE}; font-size: 11px; border: none; background: transparent;")
+            return
+        self.new_user_login.clear()
+        self.new_user_password.clear()
+        self.users_status.setText(f"Пользователь {username} создан.")
+        self.users_status.setStyleSheet(f"color: {POSITIVE}; font-size: 11px; border: none; background: transparent;")
+        self._load_users()
 
 
 # ---------------------------------------------------------------------------
@@ -2672,48 +2493,49 @@ class SettingsTab(QScrollArea):
 # ---------------------------------------------------------------------------
 
 class SyntheticDataTab(QWidget):
-    """Демо-режим, очистка БД и переиндексация RAG-эмбеддингов."""
+    """Демо-режим (переключается на сервере, только admin), переиндексация
+    RAG-эмбеддингов (доступна всем — не разрушительна) и очистка БД (только
+    admin — необратимо)."""
 
-    def __init__(self, settings_manager: SettingsManager, incident_repo: IncidentRepository,
-                 config_repo: ConfigDiffRepository, incident_rag=None, config_rag=None,
-                 offline_mode: bool = False):
+    def __init__(self, jobs_client: ApiJobsClient, admin_client: ApiAdminClient,
+                 incident_repo: ApiIncidentRepository, config_repo: ApiConfigRepository, is_admin: bool):
         super().__init__()
-        self.settings_manager = settings_manager
+        self.jobs_client = jobs_client
+        self.admin_client = admin_client
         self.incident_repo = incident_repo
         self.config_repo = config_repo
-        self.incident_rag = incident_rag
-        self.config_rag = config_rag
-        self.offline_mode = offline_mode
+        self.is_admin = is_admin
         self._reindex_workers: list[ComparisonWorker] = []
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(16)
 
-        card = Card(radius=18)
-        layout = QVBoxLayout(card)
-        layout.setContentsMargins(24, 20, 24, 20)
-        layout.setSpacing(12)
+        if is_admin:
+            card = Card(radius=18)
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(24, 20, 24, 20)
+            layout.setSpacing(12)
 
-        layout.addWidget(_label("Режим синтетических данных", size=14, weight=700))
-        desc = QLabel(
-            "Включает вымышленные данные (MockZabbixClient / MockOxidizedClient) вместо "
-            "реального подключения к предприятию."
-        )
-        desc.setWordWrap(True)
-        desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; border: none; background: transparent;")
-        layout.addWidget(desc)
+            layout.addWidget(_label("Режим синтетических данных", size=14, weight=700))
+            desc = QLabel(
+                "Включает вымышленные данные (Mock-клиенты Zabbix/Oxidized) на СЕРВЕРЕ "
+                "вместо реального подключения к предприятию. Влияет сразу на все три "
+                "серверных процесса."
+            )
+            desc.setWordWrap(True)
+            desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; border: none; background: transparent;")
+            layout.addWidget(desc)
 
-        settings = self.settings_manager.load()
-        self.checkbox = QCheckBox("Использовать синтетические данные (демо-режим)")
-        self.checkbox.setChecked(settings.use_synthetic_data)
-        layout.addWidget(self.checkbox)
+            self.checkbox = QCheckBox("Использовать синтетические данные (демо-режим)")
+            layout.addWidget(self.checkbox)
 
-        save_btn = QPushButton("Применить")
-        save_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
-        save_btn.clicked.connect(self._save)
-        layout.addWidget(save_btn, alignment=Qt.AlignLeft)
+            save_btn = QPushButton("Применить")
+            save_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
+            save_btn.clicked.connect(self._save)
+            layout.addWidget(save_btn, alignment=Qt.AlignLeft)
 
-        root.addWidget(card)
+            self._load_synthetic_flag()
+            root.addWidget(card)
 
         # --- RAG: переиндексация ---
         rag_card = Card(radius=18)
@@ -2724,8 +2546,8 @@ class SyntheticDataTab(QWidget):
         rag_layout.addWidget(_label("RAG — база знаний из истории", size=14, weight=700))
         rag_desc = QLabel(
             "Считает векторные представления (embedding) для записей истории, у которых "
-            "их ещё нет. Нужно запускать после накопления новых проанализированных "
-            "инцидентов/конфигураций, чтобы RAG видел свежие случаи."
+            "их ещё нет — выполняется на сервере (задание reindex_embeddings). Нужно "
+            "запускать после накопления новых проанализированных инцидентов/конфигураций."
         )
         rag_desc.setWordWrap(True)
         rag_desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; border: none; background: transparent;")
@@ -2738,79 +2560,66 @@ class SyntheticDataTab(QWidget):
 
         root.addWidget(rag_card)
 
-        # --- Очистка БД ---
-        danger_card = Card(radius=18, accent_left=NEGATIVE)
-        danger_layout = QVBoxLayout(danger_card)
-        danger_layout.setContentsMargins(24, 20, 24, 20)
-        danger_layout.setSpacing(12)
+        # --- Очистка БД (только admin) ---
+        if is_admin:
+            danger_card = Card(radius=18, accent_left=NEGATIVE)
+            danger_layout = QVBoxLayout(danger_card)
+            danger_layout.setContentsMargins(24, 20, 24, 20)
+            danger_layout.setSpacing(12)
 
-        danger_layout.addWidget(_label("Очистка базы данных", size=14, weight=700, color=NEGATIVE))
-        danger_desc = QLabel(
-            "Удаляет ВСЮ историю инцидентов и все результаты проверок конфигураций "
-            "(diff и полный аудит) из PostgreSQL. Действие необратимо."
-        )
-        danger_desc.setWordWrap(True)
-        danger_desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; border: none; background: transparent;")
-        danger_layout.addWidget(danger_desc)
+            danger_layout.addWidget(_label("Очистка базы данных", size=14, weight=700, color=NEGATIVE))
+            danger_desc = QLabel(
+                "Удаляет ВСЮ историю инцидентов и все результаты проверок конфигураций "
+                "(diff и полный аудит) из PostgreSQL. Действие необратимо."
+            )
+            danger_desc.setWordWrap(True)
+            danger_desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px; border: none; background: transparent;")
+            danger_layout.addWidget(danger_desc)
 
-        clear_btn = QPushButton("Очистить все данные (алерты + конфигурации)")
-        clear_btn.setStyleSheet(
-            f"QPushButton {{ background: transparent; color: {NEGATIVE}; "
-            f"border: 1px solid {NEGATIVE}; border-radius: 8px; padding: 9px 16px; "
-            f"font-size: 12px; font-weight: 600; }}"
-            f"QPushButton:hover {{ background: rgba(248,113,113,0.1); }}"
-        )
-        clear_btn.clicked.connect(self._clear_database)
-        danger_layout.addWidget(clear_btn, alignment=Qt.AlignLeft)
+            clear_btn = QPushButton("Очистить все данные (алерты + конфигурации)")
+            clear_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {NEGATIVE}; "
+                f"border: 1px solid {NEGATIVE}; border-radius: 8px; padding: 9px 16px; "
+                f"font-size: 12px; font-weight: 600; }}"
+                f"QPushButton:hover {{ background: rgba(248,113,113,0.1); }}"
+            )
+            clear_btn.clicked.connect(self._clear_database)
+            danger_layout.addWidget(clear_btn, alignment=Qt.AlignLeft)
 
-        root.addWidget(danger_card)
+            root.addWidget(danger_card)
         root.addStretch()
 
     def _shutdown(self) -> None:
         for worker in self._reindex_workers:
             _disconnect_worker(worker)
 
+    def _load_synthetic_flag(self) -> None:
+        try:
+            config = self.admin_client.get_service_config()
+            self.checkbox.setChecked(bool(config.get("use_synthetic_data")))
+        except ApiError:
+            pass
+
     def _save(self):
-        settings = self.settings_manager.load()
-        settings.use_synthetic_data = self.checkbox.isChecked()
-        self.settings_manager.save(settings)
+        try:
+            self.admin_client.update_service_config({"use_synthetic_data": self.checkbox.isChecked()})
+        except ApiError as e:
+            warn_box(self, "Ошибка сохранения", str(e))
+            return
         info_box(
-            self, "Синтетические данные", "Сохранено. Перезапустите приложение для применения."
+            self, "Синтетические данные",
+            "Сохранено. Перезапустите серверные службы (realtime_service.py / "
+            "job_worker.py / api_server.py) для применения.",
         )
 
     def _reindex(self):
-        if self.incident_rag is None and self.config_rag is None:
-            if self.offline_mode:
-                # Раньше здесь всегда советовали "ollama pull nomic-embed-text",
-                # даже когда реальная причина — офлайн-режим на SQLite (нет
-                # pgvector вообще). Никакая модель эту причину не устранит.
-                warn_box(
-                    self, "RAG недоступен",
-                    "Приложение сейчас работает в офлайн-режиме на локальном SQLite "
-                    "(PostgreSQL недоступен) — RAG требует pgvector и доступен только "
-                    "с PostgreSQL. Настройте подключение на вкладке Настройки → "
-                    "PostgreSQL и перезапустите приложение.",
-                )
-            else:
-                warn_box(
-                    self, "RAG недоступен",
-                    "Модель nomic-embed-text не найдена в Ollama. Выполните: ollama pull nomic-embed-text",
-                )
-            return
-
         # Переиндексация — это потенциально сотни последовательных HTTP-вызовов
-        # к Ollama плюс запросы к БД; раньше выполнялась прямо в обработчике
-        # клика на GUI-потоке и полностью замораживала интерфейс на время
-        # всей операции. Теперь — в фоне, кнопка блокируется до завершения.
+        # к Ollama; выполняется сервером через очередь заданий, а не прямо
+        # здесь, чтобы не морозить интерфейс на время всей операции.
         self.reindex_btn.setEnabled(False)
         self.reindex_btn.setText("Переиндексирую...")
 
-        def task():
-            incidents_indexed = self.incident_rag.reindex_missing(self.incident_repo) if self.incident_rag else 0
-            configs_indexed = self.config_rag.reindex_missing(self.config_repo) if self.config_rag else 0
-            return {"incidents": incidents_indexed, "configs": configs_indexed}
-
-        worker = ComparisonWorker(task)
+        worker = ComparisonWorker(lambda: self.jobs_client.run_job_blocking("reindex_embeddings", {}))
         worker.finished.connect(lambda result: self._on_reindex_finished(worker, result))
         worker.error.connect(lambda msg: self._on_reindex_error(worker, msg))
         self._reindex_workers.append(worker)
@@ -2841,8 +2650,12 @@ class SyntheticDataTab(QWidget):
         if not confirmed:
             return
 
-        incidents_deleted = self.incident_repo.clear_all()
-        configs_deleted = self.config_repo.clear_all()
+        try:
+            incidents_deleted = self.incident_repo.clear_all()
+            configs_deleted = self.config_repo.clear_all()
+        except ApiError as e:
+            warn_box(self, "Ошибка очистки", str(e))
+            return
 
         info_box(
             self, "Готово",
@@ -3138,7 +2951,7 @@ class AnalyticsTab(QScrollArea):
     повторяемость инцидентов, риск конфигураций) + экспорт полной истории
     в PDF/Excel — для главы про экономический эффект в дипломе."""
 
-    def __init__(self, incident_repo: IncidentRepository, config_repo: ConfigDiffRepository):
+    def __init__(self, incident_repo: ApiIncidentRepository, config_repo: ApiConfigRepository):
         super().__init__()
         self.incident_repo = incident_repo
         self.config_repo = config_repo
@@ -3383,11 +3196,10 @@ class ChatBubble(QWidget):
 
 
 class ChatTab(QWidget):
-    """Чат на естественном языке по истории мониторинга. Контекст собирается
-    детерминированно (chat_query.py, без RAG/эмбеддингов) — работает
-    одинаково в PostgreSQL- и SQLite-режимах. Короткая память (последние
-    3 пары вопрос-ответ) передаётся в промпт для связных уточняющих
-    вопросов в рамках одной сессии."""
+    """Чат на естественном языке по истории мониторинга. Контекст (без RAG,
+    только детерминированные фильтры хоста/периода — chat_query.py) и сам
+    вызов LLM теперь выполняет сервер целиком в одном запросе POST /chat —
+    клиент только передаёт вопрос и короткую память последних вопросов-ответов."""
 
     SUGGESTIONS = [
         "Критичные инциденты за сутки",
@@ -3396,11 +3208,9 @@ class ChatTab(QWidget):
         "Что нового за неделю?",
     ]
 
-    def __init__(self, incident_repo, config_repo, analyzer):
+    def __init__(self, chat_client: ApiChatClient):
         super().__init__()
-        self.incident_repo = incident_repo
-        self.config_repo = config_repo
-        self.analyzer = analyzer
+        self.chat_client = chat_client
         self._history: list[tuple[str, str]] = []
         self._workers: list[ChatWorker] = []
 
@@ -3488,8 +3298,7 @@ class ChatTab(QWidget):
         worker.start()
 
     def _answer_task(self, question: str, history: list[tuple[str, str]]) -> str:
-        context = build_chat_context(question, self.incident_repo, self.config_repo)
-        return self.analyzer.answer_chat(question, context, history=history)
+        return self.chat_client.ask(question, history)
 
     def _on_answer(self, worker: ChatWorker, question: str, thinking_bubble: ChatBubble, answer: str):
         if worker in self._workers:
@@ -3538,11 +3347,9 @@ class SidebarNavItem(QPushButton):
 
 
 class Sidebar(QWidget):
-    def __init__(self, nav_labels: list[str], incident_repo: IncidentRepository,
-                 settings_manager: SettingsManager):
+    def __init__(self, nav_labels: list[str], incident_repo: ApiIncidentRepository):
         super().__init__()
         self.incident_repo = incident_repo
-        self.settings_manager = settings_manager
         self.setFixedWidth(268)
         # Sidebar — обычный QWidget (не QFrame/Card), а обычный QWidget как
         # ДОЧЕРНИЙ (не top-level) виджет НЕ красит фон из стиля сам по себе —
@@ -3680,6 +3487,132 @@ class Sidebar(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# Вход в систему
+# ---------------------------------------------------------------------------
+
+class LoginDialog(QDialog):
+    """Показывается перед MainWindow. Если ранее был отмечен «Запомнить
+    меня», сначала пробуем токен из Диспетчера учётных данных Windows
+    (см. client_config.py) молча, без показа окна — окно появляется только
+    если автовход не удался или токена нет."""
+
+    def __init__(self, api_base_url: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Вход — NetAI Monitor")
+        self.setFixedWidth(380)
+        self.setStyleSheet(f"""
+            QDialog {{ background: {BG}; }}
+            QLabel {{ color: {TEXT_PRIMARY}; background: transparent; }}
+            QLineEdit {{
+                background: {FIELD_BG}; color: {TEXT_PRIMARY}; border: 1px solid {PANEL_BORDER};
+                border-radius: 8px; padding: 9px 10px; font-size: 12px;
+            }}
+        """)
+
+        # Результат — сюда кладём после успешного входа, забирает вызывающий код.
+        self.session: ApiSession | None = None
+        self.auth_result: dict | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(28, 24, 28, 24)
+        layout.setSpacing(14)
+
+        layout.addWidget(_label("NetAI Monitor", size=18, weight=700))
+        layout.addWidget(_label(
+            "Интеллектуальный анализ сетевых инцидентов и конфигураций",
+            size=11, color=TEXT_MUTED,
+        ))
+
+        form = QFormLayout()
+        form.setSpacing(10)
+
+        self.server_edit = QLineEdit(api_base_url)
+        self.server_edit.setPlaceholderText("http://адрес-сервера:8000")
+        form.addRow(_label("Сервер", size=12, color=TEXT_SECONDARY), self.server_edit)
+
+        self.username_edit = QLineEdit()
+        form.addRow(_label("Логин", size=12, color=TEXT_SECONDARY), self.username_edit)
+
+        self.password_edit = QLineEdit()
+        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit.returnPressed.connect(self._try_login)
+        form.addRow(_label("Пароль", size=12, color=TEXT_SECONDARY), self.password_edit)
+
+        layout.addLayout(form)
+
+        self.remember_checkbox = QCheckBox("Запомнить меня на этом компьютере")
+        layout.addWidget(self.remember_checkbox)
+
+        self.status_label = _label("", size=11, color=NEGATIVE)
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+
+        self.login_btn = QPushButton("Войти")
+        self.login_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
+        self.login_btn.clicked.connect(self._try_login)
+        layout.addWidget(self.login_btn)
+
+        self.username_edit.setFocus()
+
+    def _try_login(self) -> None:
+        server = self.server_edit.text().strip().rstrip("/")
+        username = self.username_edit.text().strip()
+        password = self.password_edit.text()
+        if not server or not username or not password:
+            self.status_label.setText("Заполните сервер, логин и пароль.")
+            return
+
+        self.login_btn.setEnabled(False)
+        self.login_btn.setText("Вхожу...")
+        self.status_label.setText("")
+        QApplication.processEvents()
+
+        session = ApiSession(server)
+        try:
+            result = ApiAuthClient(session).login(
+                username, password, remember_me=self.remember_checkbox.isChecked(),
+            )
+        except AuthError as e:
+            self.status_label.setText(str(e))
+            self.login_btn.setEnabled(True)
+            self.login_btn.setText("Войти")
+            return
+        except ApiError as e:
+            self.status_label.setText(str(e))
+            self.login_btn.setEnabled(True)
+            self.login_btn.setText("Войти")
+            return
+
+        save_client_config({**load_client_config(), "api_base_url": server})
+        if self.remember_checkbox.isChecked():
+            save_remembered_session(username, result["token"])
+        else:
+            clear_remembered_session()
+
+        self.session = session
+        self.auth_result = result
+        self.accept()
+
+    @staticmethod
+    def try_auto_login(api_base_url: str) -> tuple[ApiSession, dict] | None:
+        """Тихая попытка входа по запомненному токену — без показа диалога.
+        Если сервер отклонил токен (истёк/сессия удалена администратором),
+        просто забываем его и возвращаем None — вызывающий код покажет
+        обычный диалог входа."""
+        remembered = load_remembered_session()
+        if remembered is None:
+            return None
+        username, token = remembered
+        session = ApiSession(api_base_url, token=token)
+        try:
+            me = ApiAuthClient(session).me()
+        except ApiError:
+            clear_remembered_session()
+            return None
+        return session, {"token": token, "username": me["username"], "role": me["role"]}
+
+
+# ---------------------------------------------------------------------------
 # Главное окно
 # ---------------------------------------------------------------------------
 
@@ -3749,15 +3682,26 @@ class Toast(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, incident_repo, config_repo, settings_manager: SettingsManager,
-                 zabbix_client, oxidized_client, analyzer, incident_rag=None, config_rag=None,
-                 offline_mode: bool = False, status_repo=None):
+    def __init__(self, session: ApiSession, auth_result: dict):
         super().__init__()
         self.setWindowTitle("NetAI Monitor — интеллектуальный анализ сетевой инфраструктуры")
         self.setWindowIcon(app_icon())
         self.resize(1360, 840)
         self.setStyleSheet(APP_STYLESHEET)
-        self.offline_mode = offline_mode
+        self.session = session
+        self.auth_result = auth_result
+        self.is_admin = auth_result["role"] == "admin"
+
+        # Тонкий клиент: все репозитории и клиенты — обёртки над одним HTTP-
+        # сеансом до api_server.py, никакого прямого обращения к БД/Ollama/
+        # Zabbix/Oxidized (см. api_client.py).
+        incident_repo = ApiIncidentRepository(session)
+        config_repo = ApiConfigRepository(session)
+        jobs_client = ApiJobsClient(session)
+        chat_client = ApiChatClient(session)
+        service_status_client = ApiServiceStatusClient(session)
+        admin_client = ApiAdminClient(session)
+        self._auth_client = ApiAuthClient(session)
 
         central = GlowBackground()
         root = QHBoxLayout(central)
@@ -3766,14 +3710,14 @@ class MainWindow(QMainWindow):
 
         nav_labels = ["Дашборд", "Алерты", "Конфигурации", "Настройки",
                       "Синтетические данные", "Генератор", "Аналитика", "Чат"]
-        self.sidebar = Sidebar(nav_labels, incident_repo, settings_manager)
+        self.sidebar = Sidebar(nav_labels, incident_repo)
         root.addWidget(self.sidebar)
 
         self.stack = QStackedWidget()
         self.stack.setStyleSheet("background: transparent;")
         self.dashboard_tab = DashboardTab(incident_repo, config_repo)
-        self.alerts_tab = AlertsTab(zabbix_client, analyzer, incident_repo, rag=incident_rag)
-        self.configs_tab = ConfigsTab(oxidized_client, analyzer, config_repo, rag=config_rag)
+        self.alerts_tab = AlertsTab(jobs_client, incident_repo)
+        self.configs_tab = ConfigsTab(jobs_client, config_repo)
         self.generator_tab = GeneratorTab(
             on_send_incident=self.alerts_tab.submit_incident,
             on_send_config=self.configs_tab.submit_config,
@@ -3781,15 +3725,14 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.dashboard_tab)
         self.stack.addWidget(self.alerts_tab)
         self.stack.addWidget(self.configs_tab)
-        self.stack.addWidget(SettingsTab(settings_manager, offline_mode=offline_mode,
-                                          status_repo=status_repo))
-        self.stack.addWidget(SyntheticDataTab(settings_manager, incident_repo, config_repo,
-                                               incident_rag=incident_rag, config_rag=config_rag,
-                                               offline_mode=offline_mode))
+        self.stack.addWidget(SettingsTab(
+            session, auth_result, admin_client, service_status_client, self.is_admin, on_logout=self._logout,
+        ))
+        self.stack.addWidget(SyntheticDataTab(jobs_client, admin_client, incident_repo, config_repo, self.is_admin))
         self.stack.addWidget(self.generator_tab)
         self.analytics_tab = AnalyticsTab(incident_repo, config_repo)
         self.stack.addWidget(self.analytics_tab)
-        self.chat_tab = ChatTab(incident_repo, config_repo, analyzer)
+        self.chat_tab = ChatTab(chat_client)
         self.stack.addWidget(self.chat_tab)
         root.addWidget(self.stack, stretch=1)
 
@@ -3804,13 +3747,20 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.setStatusBar(QStatusBar())
-        mode = "Синтетические данные (демо)" if settings_manager.load().use_synthetic_data else "Боевые данные"
-        analyzer_mode = "Ollama (локально)" if isinstance(analyzer, OllamaAnalyzer) else "Rule-based (офлайн)"
-        rag_mode = "RAG включён" if incident_rag else "RAG выключен"
-        storage_mode = "БД: SQLite офлайн (PostgreSQL недоступен)" if offline_mode else "БД: PostgreSQL"
+        role_ru = "администратор" if self.is_admin else "инженер"
         self.statusBar().showMessage(
-            f"режим: {mode}  |  ИИ: {analyzer_mode}  |  {rag_mode}  |  {storage_mode}"
+            f"пользователь: {auth_result['username']} ({role_ru})  |  сервер: {session.base_url}"
         )
+
+    def _logout(self) -> None:
+        if not confirm_box(self, "Выход", "Выйти из системы? Приложение закроется — войдите заново, чтобы продолжить работу."):
+            return
+        try:
+            self._auth_client.logout()
+        except ApiError:
+            pass  # сессия и так истекла/уже удалена — выходим в любом случае
+        clear_remembered_session()
+        self.close()
 
     def _on_nav_clicked(self, index: int):
         self.stack.setCurrentIndex(index)
@@ -3857,9 +3807,11 @@ class MainWindow(QMainWindow):
         self.dashboard_tab.refresh()
 
 
-def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbix_client,
-            oxidized_client, analyzer, incident_rag=None, config_rag=None, offline_mode: bool = False,
-            status_repo=None):
+def run_app():
+    """Точка входа тонкого клиента: поднимает QApplication, пробует тихий
+    автовход по запомненному токену (см. client_config.py), иначе показывает
+    LoginDialog — и только после успешного входа строит MainWindow. Если
+    пользователь закрывает диалог входа без входа, приложение завершается."""
     app = QApplication.instance() or QApplication([])
     load_bundled_fonts()
     # Fusion — кроссплатформенный стиль, полностью отрисовываемый через QSS.
@@ -3873,8 +3825,18 @@ def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbi
     # окна в отдельные top-level диалоги, и кнопки/фон остаются дефолтными.
     app.setStyleSheet(APP_STYLESHEET)
     app.setWindowIcon(app_icon())
-    window = MainWindow(incident_repo, config_repo, settings_manager, zabbix_client, oxidized_client,
-                         analyzer, incident_rag=incident_rag, config_rag=config_rag,
-                         offline_mode=offline_mode, status_repo=status_repo)
+
+    client_config = load_client_config()
+    auto = LoginDialog.try_auto_login(client_config["api_base_url"])
+    if auto is not None:
+        session, auth_result = auto
+    else:
+        dialog = LoginDialog(client_config["api_base_url"])
+        dialog.setWindowIcon(app_icon())
+        if dialog.exec() != QDialog.Accepted or dialog.session is None:
+            return
+        session, auth_result = dialog.session, dialog.auth_result
+
+    window = MainWindow(session, auth_result)
     window.showMaximized()
     app.exec()

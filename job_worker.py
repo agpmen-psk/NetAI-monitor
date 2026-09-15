@@ -19,7 +19,8 @@ job_worker.py — служба обработки очереди LLM-задан�
   config_submit_external  {"node","review_type","text"}   → {"row_id", "node", "risk_level"}
   incident_submit_external {"id","host","problem_name",
                              "severity","timestamp",
-                             "item_key","last_value"}      → {"id", "summary", "recommendation"}
+                             "item_key","last_value"}      → {"id", "summary",
+                                                                "recommendation", "duplicate_note"}
   rag_comparison_incident {"incident_id"}                 → {with/without summary+recommendation, rag_context}
   rag_comparison_config   {"config_id"}                   → {with/without summary+recommendation, rag_context}
   reindex_embeddings      {}                               → {"incidents": N, "configs": M}
@@ -165,6 +166,27 @@ class JobHandlers:
 
     # --- Инциденты ------------------------------------------------------------
 
+    # Заметно строже общего RAG-порога релевантности контекста промпта
+    # (см. rag.py max_distance=0.4 по умолчанию) — для «это дубликат» нужна
+    # почти точная идентичность текста, а не просто тематическая похожесть.
+    # Раньше эту проверку делал клиент сам (у него был прямой доступ к RAG);
+    # теперь RAG есть только у сервера, поэтому проверка переехала сюда.
+    DUPLICATE_MAX_DISTANCE = 0.08
+
+    def _check_duplicate(self, inc: Incident) -> str | None:
+        if self.incident_rag is None:
+            return None
+        try:
+            similar = self.incident_rag.find_similar(
+                inc.problem_name, limit=3, max_distance=self.DUPLICATE_MAX_DISTANCE,
+            )
+        except Exception:
+            return None
+        for s in similar:
+            if s["host"] == inc.host:
+                return f"похоже на повтор случая «{s['problem_name']}» на {s['host']} из истории"
+        return None
+
     def _handle_incident_submit_external(self, payload: dict) -> dict:
         """Из Генератора: один синтетический инцидент, введённый оператором
         вручную — анализируется и сохраняется так же, как обычный новый
@@ -174,6 +196,9 @@ class JobHandlers:
             severity=Severity(int(payload["severity"])), timestamp=datetime.fromisoformat(payload["timestamp"]),
             item_key=payload.get("item_key", ""), last_value=payload.get("last_value", ""),
         )
+        # До сохранения/эмбеддинга — иначе новый инцидент уже был бы в базе
+        # и находил бы сам себя с нулевой дистанцией.
+        duplicate_note = self._check_duplicate(inc)
         self.analyzer.analyze([inc], rag=self.incident_rag)
         self.backend.incidents.save_incidents([inc])
         if self.incident_rag is not None and inc.ai_analyzed:
@@ -184,6 +209,7 @@ class JobHandlers:
         return {
             "id": inc.id, "analyzed": inc.ai_analyzed,
             "summary": inc.ai_summary, "recommendation": inc.ai_recommendation,
+            "duplicate_note": duplicate_note,
         }
 
     def _handle_rag_comparison_incident(self, payload: dict) -> dict:

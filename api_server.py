@@ -31,7 +31,9 @@ import auth
 from backend import Backend
 from chat_query import build_context as build_chat_context
 from llm_client import get_analyzer
+from mock_oxidized_client import MockOxidizedClient
 from models import Incident, Severity
+from oxidized_client import OxidizedClient
 from service_common import setup_logging, connect_db_with_retry
 from service_config import load_service_config, save_service_config
 
@@ -41,6 +43,7 @@ log = logging.getLogger("api-server")
 # app.state, чтобы не тащить request через каждую сигнатуру эндпоинта.
 backend: Backend | None = None
 chat_analyzer = None
+oxidized_client = None  # только для лёгкого чтения списка узлов, см. GET /configs/nodes
 
 
 # ---------------------------------------------------------------------------
@@ -149,11 +152,16 @@ class ServiceConfigUpdate(BaseModel):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global backend, chat_analyzer
+    global backend, chat_analyzer, oxidized_client
     setup_logging("api-server", "api_server.log")
 
     config = load_service_config()
     backend = connect_db_with_retry(config["postgres_dsn"], lambda: True, log)
+
+    oxidized_client = (
+        MockOxidizedClient(seed=42) if config["use_synthetic_data"]
+        else OxidizedClient(base_url=config["oxidized_url"])
+    )
 
     if backend.users.count() == 0:
         # Бутстрап первого администратора — иначе войти в систему не
@@ -262,6 +270,16 @@ def set_incident_resolution(incident_id: str, body: ResolutionRequest, user: dic
 @app.get("/configs")
 def list_configs(limit: int = 100, review_type: Optional[str] = None, user: dict = Depends(get_current_user)):
     return [_row_to_json(r) for r in backend.configs.get_history(limit=limit, review_type=review_type)]
+
+
+@app.get("/configs/nodes")
+def list_config_nodes(user: dict = Depends(get_current_user)):
+    """Список устройств от Oxidized (или мок-данных) — для выпадающего списка
+    в ConfigsTab. Лёгкий синхронный вызов (как /chat), не требует очереди."""
+    try:
+        return oxidized_client.get_nodes()
+    except Exception as e:
+        raise HTTPException(502, f"Не удалось получить список устройств: {str(e)[:200]}")
 
 
 @app.post("/configs/{config_id}/resolution")

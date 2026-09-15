@@ -171,6 +171,9 @@ class ApiConfigRepository:
             path += f"&review_type={review_type}"
         return self.session.get(path)
 
+    def get_nodes(self) -> list[str]:
+        return self.session.get("/configs/nodes")
+
     def update_correction(self, row_id: int, resolution: str) -> None:
         self.session.post(f"/configs/{row_id}/resolution", json={"resolution": resolution})
 
