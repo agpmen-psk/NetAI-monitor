@@ -1442,14 +1442,35 @@ class AlertsTab(QWidget):
         if unverified_only:
             filtered = [i for i in filtered if not i.ai_verified]
 
+        # Список полностью пересоздаётся каждые 10 секунд (автообновление из
+        # БД) — без сохранения прокрутки/выделения это дёргало список к
+        # первому алерту прямо во время чтения. Запоминаем позицию скролла и
+        # id выделенного инцидента ДО clear(), восстанавливаем после.
+        scrollbar = self.list_widget.verticalScrollBar()
+        scroll_value = scrollbar.value()
+        selected_id = self._selected_incident.id if self._selected_incident else None
+
         self.list_widget.clear()
-        for inc in filtered:
+        selected_row = -1
+        for row, inc in enumerate(filtered):
             item = QListWidgetItem()
             widget = IncidentRow(inc)
             item.setSizeHint(widget.sizeHint())
             item.setData(Qt.UserRole, inc)
             self.list_widget.addItem(item)
             self.list_widget.setItemWidget(item, widget)
+            if inc.id == selected_id:
+                selected_row = row
+
+        if selected_row >= 0:
+            # setCurrentRow не эмитит itemClicked (тот срабатывает только на
+            # реальный клик), поэтому это не вызовет повторно mark_opened/
+            # side-эффекты _on_select — только восстанавливает подсветку.
+            self.list_widget.setCurrentRow(selected_row)
+        # После setCurrentRow — Qt по умолчанию сам прокручивает к текущему
+        # элементу (ensureVisible), это нужно перекрыть восстановленным
+        # значением скролла, иначе оно опять уедет.
+        scrollbar.setValue(scroll_value)
 
         missed_count = sum(1 for i in self._all_incidents if i.resolved_at is not None and i.opened_at is None)
         self.view_closed_btn.setText(f"Закрытые ({missed_count} пропущено)" if missed_count else "Закрытые")
