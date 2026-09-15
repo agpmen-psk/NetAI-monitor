@@ -97,6 +97,54 @@ CREATE TABLE IF NOT EXISTS service_heartbeat (
     service_host    TEXT,
     pid             INTEGER
 );
+
+-- Учётные записи и сессии API. Десктоп-клиент теперь тонкий: не знает ни
+-- пароля PostgreSQL, ни адреса Ollama/Zabbix — только URL API и (после
+-- входа) токен сессии. role: 'admin' — управляет пользователями и
+-- серверными настройками (Zabbix, интервал опроса, модели), 'engineer' —
+-- работает с алертами/конфигами/чатом, серверные настройки видит, но не
+-- редактирует.
+CREATE TABLE IF NOT EXISTS users (
+    id              SERIAL PRIMARY KEY,
+    username        TEXT UNIQUE NOT NULL,
+    password_hash   TEXT NOT NULL,
+    role            TEXT NOT NULL DEFAULT 'engineer',
+    is_active       BOOLEAN NOT NULL DEFAULT true,
+    created_at      TIMESTAMP NOT NULL DEFAULT now(),
+    last_login_at   TIMESTAMP
+);
+
+-- Токен хранится ХЕШЕМ (sha256), не в открытом виде — так же, как пароль:
+-- утечка БД не должна означать возможность входа под чужой сессией.
+-- expires_at различается для обычного входа и "запомнить меня" (см.
+-- auth.py: TOKEN_TTL_HOURS / REMEMBER_TTL_DAYS).
+CREATE TABLE IF NOT EXISTS sessions (
+    token_hash      TEXT PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    created_at      TIMESTAMP NOT NULL DEFAULT now(),
+    expires_at      TIMESTAMP NOT NULL,
+    remember_me     BOOLEAN NOT NULL DEFAULT false
+);
+
+-- Очередь длинных LLM-операций (аудит конфига, сравнение с RAG/без,
+-- переиндексация, анализ из Генератора) — выполняет worker-служба
+-- (realtime_service.py), а НЕ сама API-служба: иначе долгий вызов Ollama
+-- (30-120с) занимал бы один из немногих обработчиков API и замедлял бы
+-- ответы всем остальным клиентам одновременно.
+CREATE TABLE IF NOT EXISTS job_queue (
+    id              SERIAL PRIMARY KEY,
+    job_type        TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    payload         JSONB NOT NULL,
+    result          JSONB,
+    error           TEXT,
+    created_by      INTEGER REFERENCES users(id),
+    created_at      TIMESTAMP NOT NULL DEFAULT now(),
+    started_at      TIMESTAMP,
+    finished_at     TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_job_queue_pending ON job_queue (status, created_at)
+    WHERE status = 'pending';
 """
 
 DEFAULT_SETTINGS = {
@@ -159,14 +207,18 @@ class SettingsRepository:
 
 
 class ServiceStatusRepository:
-    """Статус фонового сервиса реального времени — единственная строка
-    (id=1), которую пишет realtime_service.py и читает GUI (см.
-    SettingsTab: карточка «Сервис реального времени»)."""
+    """Статус фоновых служб на сервере — по одной строке на службу
+    (service_id=1 — realtime_service.py/опрос Zabbix, service_id=2 —
+    job_worker.py/очередь LLM-заданий). API-служба отдаёт обе клиенту (см.
+    SettingsTab: карточка «Службы на сервере»)."""
+
+    REALTIME = 1
+    JOB_WORKER = 2
 
     def __init__(self, db: Database):
         self.db = db
 
-    def write(self, status: str, message: str = "", zabbix_ok: bool | None = None,
+    def write(self, service_id: int, status: str, message: str = "", zabbix_ok: bool | None = None,
               zabbix_message: str = "", last_poll_at=None, last_new: int = 0,
               last_closed: int = 0, last_retried: int = 0,
               service_host: str = "", pid: int = 0) -> None:
@@ -177,7 +229,7 @@ class ServiceStatusRepository:
                     INSERT INTO service_heartbeat
                     (id, updated_at, status, message, zabbix_ok, zabbix_message,
                      last_poll_at, last_new, last_closed, last_retried, service_host, pid)
-                    VALUES (1, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    VALUES (%s, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (id) DO UPDATE SET
                         updated_at = now(),
                         status = EXCLUDED.status,
@@ -191,17 +243,211 @@ class ServiceStatusRepository:
                         service_host = EXCLUDED.service_host,
                         pid = EXCLUDED.pid
                     """,
-                    (status, message, zabbix_ok, zabbix_message, last_poll_at,
+                    (service_id, status, message, zabbix_ok, zabbix_message, last_poll_at,
                      last_new, last_closed, last_retried, service_host, pid),
                 )
             conn.commit()
 
-    def read(self) -> dict | None:
+    def read(self, service_id: int = 1) -> dict | None:
         with self.db._connect() as conn:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-                cur.execute("SELECT * FROM service_heartbeat WHERE id = 1")
+                cur.execute("SELECT * FROM service_heartbeat WHERE id = %s", (service_id,))
                 row = cur.fetchone()
         return dict(row) if row else None
+
+    def read_all(self) -> list[dict]:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM service_heartbeat ORDER BY id")
+                return [dict(r) for r in cur.fetchall()]
+
+
+class UserRepository:
+    """Учётные записи API. Пароли хранятся только хешем (см. auth.py) —
+    сам репозиторий о хешировании не знает, принимает уже готовый хеш."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, username: str, password_hash: str, role: str = "engineer") -> int:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO users (username, password_hash, role) VALUES (%s, %s, %s) RETURNING id",
+                    (username, password_hash, role),
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+        return new_id
+
+    def get_by_username(self, username: str) -> dict | None:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users WHERE username = %s", (username,))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def get_by_id(self, user_id: int) -> dict | None:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def list_all(self) -> list[dict]:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT id, username, role, is_active, created_at, last_login_at "
+                            "FROM users ORDER BY username")
+                return [dict(r) for r in cur.fetchall()]
+
+    def set_active(self, user_id: int, is_active: bool) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET is_active = %s WHERE id = %s", (is_active, user_id))
+            conn.commit()
+
+    def set_password(self, user_id: int, password_hash: str) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", (password_hash, user_id))
+            conn.commit()
+
+    def mark_login(self, user_id: int) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE users SET last_login_at = now() WHERE id = %s", (user_id,))
+            conn.commit()
+
+    def count(self) -> int:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM users")
+                return cur.fetchone()[0]
+
+
+class SessionRepository:
+    """Токен хранится и ищется по sha256-хешу (см. auth.py.hash_token) —
+    сам исходный токен в БД никогда не попадает, аналогично паролю."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, token_hash: str, user_id: int, expires_at, remember_me: bool) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO sessions (token_hash, user_id, expires_at, remember_me) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (token_hash, user_id, expires_at, remember_me),
+                )
+            conn.commit()
+
+    def get_valid(self, token_hash: str) -> dict | None:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT s.*, u.username, u.role, u.is_active FROM sessions s "
+                    "JOIN users u ON u.id = s.user_id "
+                    "WHERE s.token_hash = %s AND s.expires_at > now()",
+                    (token_hash,),
+                )
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def delete(self, token_hash: str) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE token_hash = %s", (token_hash,))
+            conn.commit()
+
+    def delete_expired(self) -> int:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM sessions WHERE expires_at <= now()")
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
+
+
+class JobQueueRepository:
+    """Очередь заданий для worker-службы — см. job_worker.py. API-служба
+    только создаёт записи и опрашивает их статус, сама LLM не вызывает."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def enqueue(self, job_type: str, payload: dict, created_by: int | None = None) -> int:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO job_queue (job_type, payload, created_by) VALUES (%s, %s, %s) RETURNING id",
+                    (job_type, psycopg2.extras.Json(payload), created_by),
+                )
+                new_id = cur.fetchone()[0]
+            conn.commit()
+        return new_id
+
+    def get(self, job_id: int) -> dict | None:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM job_queue WHERE id = %s", (job_id,))
+                row = cur.fetchone()
+        return dict(row) if row else None
+
+    def claim_next(self) -> dict | None:
+        """Атомарно берёт самое старое 'pending' задание и сразу помечает
+        его 'running' — FOR UPDATE SKIP LOCKED делает это безопасным, даже
+        если бы воркеров было несколько (сейчас один, но не полагаемся на
+        это неявно)."""
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM job_queue WHERE status = 'pending' "
+                    "ORDER BY created_at ASC LIMIT 1 FOR UPDATE SKIP LOCKED"
+                )
+                row = cur.fetchone()
+                if row is None:
+                    conn.commit()
+                    return None
+                cur.execute(
+                    "UPDATE job_queue SET status = 'running', started_at = now() WHERE id = %s",
+                    (row["id"],),
+                )
+            conn.commit()
+        return dict(row)
+
+    def complete(self, job_id: int, result: dict) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE job_queue SET status = 'done', result = %s, finished_at = now() WHERE id = %s",
+                    (psycopg2.extras.Json(result), job_id),
+                )
+            conn.commit()
+
+    def fail(self, job_id: int, error: str) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE job_queue SET status = 'error', error = %s, finished_at = now() WHERE id = %s",
+                    (error[:2000], job_id),
+                )
+            conn.commit()
+
+    def purge_old(self, older_than_hours: int = 72) -> int:
+        """Чистит старые завершённые задания — очередь не должна расти
+        бесконечно (та же логика, что учли для incidents в realtime_engine)."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM job_queue WHERE status IN ('done', 'error') "
+                    "AND finished_at < now() - (%s || ' hours')::interval",
+                    (older_than_hours,),
+                )
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
 
 
 class IncidentRepository:
@@ -265,6 +511,16 @@ class IncidentRepository:
                 )
                 rows = cur.fetchall()
         return [self._row_to_incident(r) for r in rows]
+
+    def get_by_id(self, incident_id: str) -> Incident | None:
+        """Для job_worker.py: сравнение «с RAG / без RAG» получает не сам
+        объект инцидента (клиент их больше не хранит), а только id — и
+        запрашивает актуальную запись сам, на сервере."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT {self._ROW_COLUMNS} FROM incidents WHERE id = %s", (incident_id,))
+                row = cur.fetchone()
+        return self._row_to_incident(row) if row else None
 
     def get_existing_ids(self, ids: List[str]) -> set:
         """Какие из переданных id уже есть в БД — используется реальным
@@ -476,6 +732,13 @@ class ConfigDiffRepository:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute(query, params)
                 return list(cur.fetchall())
+
+    def get_by_id(self, row_id: int) -> dict | None:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM config_diffs WHERE id = %s", (row_id,))
+                row = cur.fetchone()
+        return dict(row) if row else None
 
     def get_without_embedding(self, limit: int = 500) -> List[dict]:
         with self.db._connect() as conn:
