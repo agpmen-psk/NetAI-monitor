@@ -1258,22 +1258,26 @@ QPushButton:hover:!checked {{ border: 1px solid {ACCENT}; color: {TEXT_PRIMARY};
 
 
 class AlertsTab(QWidget):
-    """Работа с инцидентами Zabbix в реальном времени. Раз в минуту опрашивает
-    Zabbix, анализирует только НОВЫЕ проблемы через LLM (не переанализирует
-    уже известные при каждом опросе) и определяет закрытие: если ранее
-    активный (и хоть раз пришедший через опрос) инцидент пропал из свежего
-    среза активных — считаем его закрытым в Zabbix и переносим в фильтр
-    «Закрытые», без ожидания следующего ручного обновления. Использует
-    IncidentRAG для похожих случаев."""
+    """Отображение инцидентов Zabbix. Сам опрос Zabbix и анализ через LLM
+    теперь выполняет отдельный фоновый сервис (см. realtime_service.py),
+    работающий постоянно на сервере рядом с PostgreSQL/Ollama — независимо
+    от того, открыт ли у кого-то десктоп-клиент. AlertsTab лишь периодически
+    перечитывает общую историю из БД и отражает то, что там появилось:
+    новые проанализированные алерты (тост + непрочитанное), закрытие в
+    Zabbix (переезд в фильтр «Закрытые») — раньше вся эта логика опроса и
+    анализа жила прямо в GUI, и ничего не происходило, пока приложение было
+    закрыто. Использует IncidentRAG для похожих случаев (сравнение с/без RAG)."""
 
     incident_added = Signal()
     unread_changed = Signal(bool)
-    # Испускается при появлении новых проанализированных алертов (и через
-    # реальное время, и через прямую отправку из Генератора) — MainWindow
-    # слушает это, чтобы показать всплывающий тост поверх любой вкладки.
+    # Испускается при появлении новых проанализированных алертов (и из
+    # общей БД от фонового сервиса, и через прямую отправку из Генератора) —
+    # MainWindow слушает это, чтобы показать всплывающий тост поверх любой вкладки.
     new_realtime_alert = Signal(list)
 
-    POLL_INTERVAL_MS = 60_000
+    # Лёгкое чтение из БД (не опрос Zabbix и не вызов LLM — это теперь на
+    # сервере), поэтому интервал можно держать коротким.
+    DB_REFRESH_INTERVAL_MS = 10_000
 
     def __init__(self, zabbix_client, analyzer, repo: IncidentRepository, rag=None):
         super().__init__()
@@ -1284,24 +1288,19 @@ class AlertsTab(QWidget):
         self._live_workers: list[QThread] = []
         self._unread_ids: set[str] = set()
         self._show_closed = False
-        # id, которые хоть раз реально приходили из опроса Zabbix (а не были
-        # вручную отправлены из Центра генерации) — только они являются
-        # кандидатами на автозакрытие, когда пропадают из свежего среза.
-        # Иначе синтетический алерт, отправленный вручную через Генератор
-        # (Zabbix о нём ничего не знает), был бы «закрыт» уже на первом же
-        # следующем опросе — ложное срабатывание.
-        self._polled_ids: set[str] = set()
         root = QVBoxLayout(self)
         root.setContentsMargins(28, 24, 28, 24)
         root.setSpacing(14)
 
         top_bar = QHBoxLayout()
-        self.refresh_btn = QPushButton("Проверить сейчас")
+        self.refresh_btn = QPushButton("Обновить список")
         self.refresh_btn.setStyleSheet(PRIMARY_BUTTON_STYLE)
-        self.refresh_btn.clicked.connect(self._manual_poll)
+        self.refresh_btn.clicked.connect(self._manual_reload)
         top_bar.addWidget(self.refresh_btn)
 
-        self.realtime_indicator = _label("● реальное время: опрос раз в минуту", size=11, color=POSITIVE, weight=700)
+        self.realtime_indicator = _label(
+            "● автообновление из общей БД каждые 10 сек", size=11, color=POSITIVE, weight=700,
+        )
         top_bar.addWidget(self.realtime_indicator)
 
         top_bar.addStretch()
@@ -1316,8 +1315,8 @@ class AlertsTab(QWidget):
         top_bar.addWidget(rag_status)
         root.addLayout(top_bar)
 
-        self._realtime_timer = QTimer(self)
-        self._realtime_timer.timeout.connect(self._realtime_tick)
+        self._db_refresh_timer = QTimer(self)
+        self._db_refresh_timer.timeout.connect(self._reload_from_db)
 
         filter_row = QHBoxLayout()
         self.view_group = QButtonGroup(self)
@@ -1414,15 +1413,8 @@ class AlertsTab(QWidget):
         # то, что уже было в истории при открытии приложения, не считается «новым» —
         # непрочитанным помечается только то, что появится после этого момента
         self._seen_ids = {inc.id for inc in self._all_incidents}
-        # При старте оптимистично считаем всё, что уже числится активным в
-        # БД, пришедшим из опроса — иначе эти записи никогда не попадут под
-        # автозакрытие, пока реально не встретятся в свежем ответе Zabbix
-        # (для только что отправленных вручную из Генератора это тоже верно
-        # в большинстве случаев, редкое исключение не критично для демо-фичи).
-        self._polled_ids = {inc.id for inc in self._all_incidents if inc.resolved_at is None}
 
-        self._realtime_timer.start(self.POLL_INTERVAL_MS)
-        QTimer.singleShot(200, self._realtime_tick)
+        self._db_refresh_timer.start(self.DB_REFRESH_INTERVAL_MS)
 
     def _load_history(self):
         self._all_incidents = self.repo.get_history()
@@ -1460,105 +1452,82 @@ class AlertsTab(QWidget):
         self._show_closed = button_id == 1
         self._apply_filters()
 
-    def _manual_poll(self) -> None:
-        """Кнопка «Проверить сейчас» — тот же опрос, что и по таймеру, просто
-        по требованию инженера, не дожидаясь следующей минуты."""
+    def _manual_reload(self) -> None:
+        """Кнопка «Обновить список» — тот же перечит БД, что и по таймеру,
+        просто по требованию инженера, не дожидаясь следующего тика."""
         if self._live_workers:
             return
-        self._realtime_tick()
+        self._reload_from_db()
 
-    def _realtime_tick(self) -> None:
-        """Раз в минуту (и по кнопке «Проверить сейчас»): лёгкий опрос Zabbix
-        БЕЗ анализа (см. _on_poll_fetched — анализируются только новые id),
-        чтобы не гонять LLM по уже известным активным проблемам на каждом
-        тике. Если предыдущий опрос/анализ ещё выполняется — тик пропускаем,
-        воркеры не копим."""
+    def _reload_from_db(self) -> None:
+        """Раз в 10 секунд (и по кнопке): лёгкое чтение общей истории из БД —
+        сам опрос Zabbix и анализ через LLM теперь делает realtime_service.py
+        на сервере, GUI только отражает то, что там появилось. Обёрнуто в
+        воркер (не прямой вызов) — PostgreSQL может быть по сети, не хотим
+        подвешивать интерфейс на медленном канале."""
         if self._live_workers:
             return
-        self.refresh_btn.setEnabled(False)
-        worker = ConfigTaskWorker(self.zabbix_client.get_active_problems)
-        worker.finished.connect(lambda fetched: self._on_poll_fetched(worker, fetched))
-        worker.error.connect(lambda msg: self._on_poll_error(worker, msg))
+        worker = ConfigTaskWorker(self.repo.get_history)
+        worker.finished.connect(lambda fresh: self._on_db_reloaded(worker, fresh))
+        worker.error.connect(lambda msg: self._on_reload_error(worker, msg))
         self._live_workers.append(worker)
         worker.start()
 
-    def _on_poll_error(self, worker: QThread, message: str) -> None:
+    def _on_reload_error(self, worker: QThread, message: str) -> None:
         if worker in self._live_workers:
             self._live_workers.remove(worker)
-        self.refresh_btn.setEnabled(True)
-        self.realtime_indicator.setText("● реальное время: ошибка опроса")
-        self.realtime_indicator.setStyleSheet(f"color: {NEGATIVE}; font-size: 11px; font-weight: 700; border: none; background: transparent;")
-        self.live_status_label.setText(f"Опрос Zabbix не удался: {message}")
+        self.realtime_indicator.setText("● БД недоступна")
+        self.realtime_indicator.setStyleSheet(
+            f"color: {NEGATIVE}; font-size: 11px; font-weight: 700; border: none; background: transparent;"
+        )
+        self.live_status_label.setText(f"Не удалось обновить список: {message}")
         self.live_status_label.setStyleSheet(f"color: {NEGATIVE}; font-size: 11px; border: none; background: transparent;")
 
-    def _on_poll_fetched(self, worker: QThread, fetched: list[Incident]) -> None:
+    def _on_db_reloaded(self, worker: QThread, fresh: list[Incident]) -> None:
         if worker in self._live_workers:
             self._live_workers.remove(worker)
-        self.realtime_indicator.setText("● реальное время: опрос раз в минуту")
-        self.realtime_indicator.setStyleSheet(f"color: {POSITIVE}; font-size: 11px; font-weight: 700; border: none; background: transparent;")
+        self.realtime_indicator.setText("● автообновление из общей БД каждые 10 сек")
+        self.realtime_indicator.setStyleSheet(
+            f"color: {POSITIVE}; font-size: 11px; font-weight: 700; border: none; background: transparent;"
+        )
 
-        fetched_ids = {i.id for i in fetched}
-        self._polled_ids |= fetched_ids
-        known_ids = {i.id for i in self._all_incidents}
-        new_incidents = [i for i in fetched if i.id not in known_ids]
-        closed_ids = [
-            i.id for i in self._all_incidents
-            if i.resolved_at is None and i.id in self._polled_ids and i.id not in fetched_ids
-        ]
+        old_by_id = {i.id: i for i in self._all_incidents}
+        # Новые проанализированные записи — появились в БД с прошлого чтения
+        # (их туда положил realtime_service.py или кто-то через Генератор на
+        # другой машине). Только уже проанализированные, чтобы не дёргать
+        # тост на промежуточном состоянии "запись создана, анализ ещё идёт".
+        new_analyzed = [i for i in fresh if i.id not in old_by_id and i.ai_analyzed]
+        newly_closed = sum(
+            1 for i in fresh
+            if i.resolved_at is not None and old_by_id.get(i.id) is not None
+            and old_by_id[i.id].resolved_at is None
+        )
+        changed = len(fresh) != len(self._all_incidents) or any(
+            old_by_id.get(i.id) is None
+            or old_by_id[i.id].ai_analyzed != i.ai_analyzed
+            or old_by_id[i.id].resolved_at != i.resolved_at
+            or old_by_id[i.id].ai_verified != i.ai_verified
+            for i in fresh
+        )
 
-        if closed_ids:
-            self.repo.mark_resolved(closed_ids)
+        self._all_incidents = fresh
+        self._apply_filters()
 
-        # Инциденты, у которых предыдущая попытка анализа не распарсилась
-        # (модель обрезала ответ на длинной пачке и т.п. — см. llm_client
-        # ._analyze_batch) остаются с ai_analyzed=False именно чтобы попасть
-        # сюда и повториться автоматически, а не застрять навсегда с
-        # текстом-заглушкой. Ограничение в 20 — чтобы одна проблемная пачка
-        # не растягивала каждый последующий тик на неопределённое время.
-        retry_incidents = [i for i in self._all_incidents if not i.ai_analyzed][:20]
-        to_analyze = new_incidents + retry_incidents
+        if new_analyzed:
+            self._mark_unread(new_analyzed)
+            self.new_realtime_alert.emit(new_analyzed)
+        if changed:
+            self.incident_added.emit()
 
-        if to_analyze:
-            new_ids = {i.id for i in new_incidents}
-            analyze_worker = IncidentWorker(self.zabbix_client, self.analyzer, rag=self.rag, incidents=to_analyze)
-            analyze_worker.finished.connect(
-                lambda incs: self._on_realtime_analyzed(analyze_worker, incs, new_ids, len(closed_ids))
-            )
-            analyze_worker.error.connect(lambda msg: self._on_live_error(analyze_worker, msg))
-            self._live_workers.append(analyze_worker)
-            analyze_worker.start()
-        else:
-            self.refresh_btn.setEnabled(True)
-            if closed_ids:
-                self._load_history()
-                self.incident_added.emit()
-            self._set_poll_status(new_count=0, closed_count=len(closed_ids))
+        self._set_reload_status(new_count=len(new_analyzed), closed_count=newly_closed)
 
-    def _on_realtime_analyzed(self, worker: QThread, incidents: list[Incident], new_ids: set[str],
-                               closed_count: int) -> None:
-        if worker in self._live_workers:
-            self._live_workers.remove(worker)
-        self._save_and_embed(incidents)
-        self._load_history()
-        self.refresh_btn.setEnabled(True)
-        # incidents тут — и новые, и повторно проанализированные (см.
-        # retry_incidents в _on_poll_fetched); тост/непрочитанное/статус
-        # должны отражать только реально НОВЫЕ, иначе тихий повтор ранее
-        # неудавшегося анализа выглядел бы как новый алерт.
-        new_only = [i for i in incidents if i.id in new_ids]
-        self._mark_unread(new_only)
-        self.incident_added.emit()
-        self._set_poll_status(new_count=len(new_only), closed_count=closed_count)
-        if new_only:
-            self.new_realtime_alert.emit(new_only)
-
-    def _set_poll_status(self, new_count: int, closed_count: int) -> None:
+    def _set_reload_status(self, new_count: int, closed_count: int) -> None:
         parts = []
         if new_count:
             parts.append(f"новых: {new_count}")
         if closed_count:
             parts.append(f"закрыто: {closed_count}")
-        text = "Обновлено — " + ", ".join(parts) if parts else "Проверено — изменений нет"
+        text = "Обновлено — " + ", ".join(parts) if parts else "Изменений нет"
         self.live_status_label.setText(text)
         self.live_status_label.setStyleSheet(
             f"color: {POSITIVE if (new_count or closed_count) else TEXT_MUTED}; "
