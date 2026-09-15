@@ -21,7 +21,7 @@ def main():
     #   setx NETAI_DB_DSN "dbname=netai_monitor user=postgres password=... host=localhost"
     # Если PostgreSQL недоступен вообще — приложение само переключится на
     # локальный SQLite-файл (%APPDATA%/NetAI Monitor/netai_local.db).
-    db, incident_repo, config_repo, settings_repo, is_postgres = create_backend()
+    db, incident_repo, config_repo, settings_repo, status_repo, is_postgres = create_backend()
     settings_manager = SettingsManager(settings_repo)
     settings = settings_manager.load()
 
@@ -66,6 +66,7 @@ def main():
         incident_rag=incident_rag,
         config_rag=config_rag,
         offline_mode=not is_postgres,
+        status_repo=status_repo,
     )
 
 

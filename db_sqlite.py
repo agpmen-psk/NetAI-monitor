@@ -57,6 +57,21 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key             TEXT PRIMARY KEY,
     value           TEXT
 );
+
+CREATE TABLE IF NOT EXISTS service_heartbeat (
+    id              INTEGER PRIMARY KEY,
+    updated_at      TEXT NOT NULL,
+    status          TEXT NOT NULL,
+    message         TEXT,
+    zabbix_ok       INTEGER,
+    zabbix_message  TEXT,
+    last_poll_at    TEXT,
+    last_new        INTEGER,
+    last_closed     INTEGER,
+    last_retried    INTEGER,
+    service_host    TEXT,
+    pid             INTEGER
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -132,6 +147,62 @@ class SQLiteSettingsRepository:
     def set_many(self, values: dict) -> None:
         for key, value in values.items():
             self.set(key, value)
+
+
+class SQLiteServiceStatusRepository:
+    """Аналог ServiceStatusRepository из db.py для офлайн-режима."""
+
+    def __init__(self, db: SQLiteDatabase):
+        self.db = db
+
+    def write(self, status: str, message: str = "", zabbix_ok: bool | None = None,
+              zabbix_message: str = "", last_poll_at=None, last_new: int = 0,
+              last_closed: int = 0, last_retried: int = 0,
+              service_host: str = "", pid: int = 0) -> None:
+        now_iso = datetime.now().isoformat()
+        poll_iso = last_poll_at.isoformat() if hasattr(last_poll_at, "isoformat") else last_poll_at
+        with self.db._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO service_heartbeat
+                (id, updated_at, status, message, zabbix_ok, zabbix_message,
+                 last_poll_at, last_new, last_closed, last_retried, service_host, pid)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    updated_at = excluded.updated_at,
+                    status = excluded.status,
+                    message = excluded.message,
+                    zabbix_ok = excluded.zabbix_ok,
+                    zabbix_message = excluded.zabbix_message,
+                    last_poll_at = COALESCE(excluded.last_poll_at, service_heartbeat.last_poll_at),
+                    last_new = excluded.last_new,
+                    last_closed = excluded.last_closed,
+                    last_retried = excluded.last_retried,
+                    service_host = excluded.service_host,
+                    pid = excluded.pid
+                """,
+                (now_iso, status, message,
+                 None if zabbix_ok is None else int(zabbix_ok), zabbix_message,
+                 poll_iso, last_new, last_closed, last_retried, service_host, pid),
+            )
+            conn.commit()
+
+    def read(self) -> dict | None:
+        with self.db._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM service_heartbeat WHERE id = 1").fetchone()
+        if not row:
+            return None
+        data = dict(row)
+        for key in ("updated_at", "last_poll_at"):
+            if isinstance(data.get(key), str):
+                try:
+                    data[key] = datetime.fromisoformat(data[key])
+                except ValueError:
+                    data[key] = None
+        if data.get("zabbix_ok") is not None:
+            data["zabbix_ok"] = bool(data["zabbix_ok"])
+        return data
 
 
 class SQLiteIncidentRepository:

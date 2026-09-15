@@ -32,11 +32,17 @@ class RealtimeEngine:
     # проблемная пачка не растягивала каждый следующий цикл опроса.
     RETRY_LIMIT = 20
 
-    def __init__(self, zabbix_client, analyzer, repo, rag=None):
+    def __init__(self, zabbix_client, analyzer, repo, rag=None, on_status=None):
         self.zabbix_client = zabbix_client
         self.analyzer = analyzer
         self.repo = repo
         self.rag = rag
+        # Необязательный колбэк on_status(status: str, message: str) —
+        # вызывается в ключевых точках цикла. Нужен фоновому сервису, чтобы
+        # обновлять heartbeat ПОСРЕДИ длинного LLM-прогона: первый опрос на
+        # непустом Zabbix может анализировать сотню инцидентов много минут,
+        # и без этого внешний наблюдатель (GUI) решил бы, что служба умерла.
+        self.on_status = on_status
         # id, которые хоть раз реально приходили из опроса Zabbix — только
         # они кандидаты на автозакрытие, когда пропадают из свежего среза.
         # Вручную добавленные (например, из Центра генерации в десктоп-
@@ -58,11 +64,21 @@ class RealtimeEngine:
         self._polled_ids = self.repo.get_open_ids()
         self._seeded = True
 
+    def _report(self, status: str, message: str) -> None:
+        if self.on_status is None:
+            return
+        try:
+            self.on_status(status, message)
+        except Exception:
+            # Наблюдатель (heartbeat в БД) не должен ломать сам цикл опроса.
+            log.warning("Не удалось сообщить статус '%s'", status, exc_info=True)
+
     def tick(self) -> dict:
         """Один цикл опроса. Возвращает {"new": int, "closed": int, "retried": int}."""
         if not self._seeded:
             self.seed()
 
+        self._report("polling", "опрашиваю Zabbix")
         log.info("Опрашиваю Zabbix...")
         fetched: List[Incident] = self.zabbix_client.get_active_problems()
         log.info("Zabbix вернул %d активных проблем.", len(fetched))
@@ -97,6 +113,11 @@ class RealtimeEngine:
                 "Начинаю анализ через LLM: новых %d, повтор %d (всего %d) — "
                 "это может занять время на локальной модели...",
                 len(new_incidents), len(retry_incidents), len(to_analyze),
+            )
+            self._report(
+                "analyzing",
+                f"анализирую {len(to_analyze)} инцидентов через LLM "
+                f"(новых {len(new_incidents)}, повтор {len(retry_incidents)})",
             )
             self.analyzer.analyze(to_analyze, rag=self.rag)
             self.repo.save_incidents(to_analyze)

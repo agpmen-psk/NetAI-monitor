@@ -36,9 +36,11 @@ from models import Incident, Severity
 from settings import AppSettings, SettingsManager
 from db import IncidentRepository, ConfigDiffRepository
 from llm_client import OllamaAnalyzer
-from zabbix_client import MockZabbixClient, ZabbixClient
+# ZabbixClient/OxidizedClient здесь больше не нужны: опрос Zabbix перенесён
+# в серверную службу (realtime_service.py), а локальная проверка подключения
+# с десктопа убрана — доступ к Zabbix есть только у серверной машины.
+from zabbix_client import MockZabbixClient
 from mock_oxidized_client import MockOxidizedClient
-from oxidized_client import OxidizedClient
 from rag import EmbeddingClient
 from local_config import (
     load_postgres_config, save_postgres_config, build_dsn, load_theme, save_theme, DEFAULTS as PG_DEFAULTS,
@@ -2183,11 +2185,17 @@ class SettingsTab(QScrollArea):
     высоте на многих экранах; без прокрутки Qt сжимает layout, чтобы влезть
     в доступную высоту, и поля визуально «плющит» друг в друга."""
 
-    def __init__(self, settings_manager: SettingsManager, on_saved=None, offline_mode: bool = False):
+    def __init__(self, settings_manager: SettingsManager, on_saved=None, offline_mode: bool = False,
+                 status_repo=None):
         super().__init__()
         self.settings_manager = settings_manager
         self.on_saved = on_saved
         self.offline_mode = offline_mode
+        # Репозиторий heartbeat фонового сервиса — через него видно, жива ли
+        # служба на сервере и доступен ли ЕЙ Zabbix. С десктопа проверить
+        # Zabbix напрямую нельзя: туннель до него поднят только на серверной
+        # машине, поэтому локальная кнопка «Проверить» всегда врала бы.
+        self.status_repo = status_repo
 
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.NoFrame)
@@ -2296,28 +2304,72 @@ class SettingsTab(QScrollArea):
         theme_layout.addWidget(theme_save_btn, alignment=Qt.AlignLeft)
         root.addWidget(theme_card)
 
-        card = Card(radius=18)
-        form_layout = QVBoxLayout(card)
-        form_layout.setContentsMargins(24, 20, 24, 20)
-        form = QFormLayout()
-        form.setSpacing(12)
+        root.addWidget(self._build_service_status_card())
 
         settings = self.settings_manager.load()
 
+        # --- Серверные параметры (только для чтения) ---
+        # Zabbix доступен только серверной машине (туннель поднят на ней), а
+        # значит задавать его с произвольного десктопа бессмысленно: опрос
+        # всё равно выполняет служба со своими настройками из
+        # service_config.json. Здесь показываем их, чтобы было видно, с чем
+        # работает сервис, но менять предлагаем там, где это действительно
+        # применяется.
+        server_card = Card(radius=18)
+        server_layout = QVBoxLayout(server_card)
+        server_layout.setContentsMargins(24, 20, 24, 20)
+        server_layout.setSpacing(10)
+        server_layout.addWidget(_label("Источники данных (настраиваются на сервере)", size=14, weight=700))
+        server_layout.addWidget(_label(
+            "Опрос Zabbix выполняет фоновая служба на сервере — только у неё есть "
+            "доступ к Zabbix (через туннель). Эти параметры задаются в файле "
+            "service_config.json на сервере и показаны здесь только для справки.",
+            size=11, color=TEXT_MUTED,
+        ))
+        server_form = QFormLayout()
+        server_form.setSpacing(12)
         self.zabbix_url = QLineEdit(settings.zabbix_url)
         self.zabbix_user = QLineEdit(settings.zabbix_user)
         self.zabbix_password = QLineEdit(settings.zabbix_password)
         self.zabbix_password.setEchoMode(QLineEdit.Password)
         self.oxidized_url = QLineEdit(settings.oxidized_url)
-        self.ollama_host = QLineEdit(settings.ollama_host)
-        self.ollama_model = QLineEdit(settings.ollama_model)
-        self.embedding_model = QLineEdit(settings.embedding_model)
-
         for label, widget in [
             ("Zabbix URL", self.zabbix_url),
             ("Zabbix логин", self.zabbix_user),
             ("Zabbix пароль", self.zabbix_password),
             ("Oxidized URL", self.oxidized_url),
+        ]:
+            widget.setReadOnly(True)
+            widget.setStyleSheet(
+                f"QLineEdit {{ background: {INSET_BG}; border: 1px solid {PANEL_BORDER}; "
+                f"border-radius: 8px; padding: 8px; color: {TEXT_MUTED}; "
+                f"font-family: {FONT_DATA}; font-size: 12px; }}"
+            )
+            server_form.addRow(_label(label, size=12, color=TEXT_SECONDARY), widget)
+        server_layout.addLayout(server_form)
+        root.addWidget(server_card)
+
+        # --- Параметры этого клиента (редактируемые) ---
+        # Ollama у каждого клиента своя по адресу: для службы это localhost
+        # сервера, для десктопов — IP того же сервера в локальной сети.
+        card = Card(radius=18)
+        form_layout = QVBoxLayout(card)
+        form_layout.setContentsMargins(24, 20, 24, 20)
+        form_layout.setSpacing(10)
+        form_layout.addWidget(_label("Ollama для этого приложения", size=14, weight=700))
+        form_layout.addWidget(_label(
+            "Используется чатом, анализом конфигураций и сравнением «с RAG / без RAG» "
+            "в этом приложении. Укажите адрес сервера, где запущена Ollama.",
+            size=11, color=TEXT_MUTED,
+        ))
+        form = QFormLayout()
+        form.setSpacing(12)
+
+        self.ollama_host = QLineEdit(settings.ollama_host)
+        self.ollama_model = QLineEdit(settings.ollama_model)
+        self.embedding_model = QLineEdit(settings.embedding_model)
+
+        for label, widget in [
             ("Ollama host", self.ollama_host),
             ("Ollama модель", self.ollama_model),
             ("Модель эмбеддингов (RAG)", self.embedding_model),
@@ -2336,21 +2388,25 @@ class SettingsTab(QScrollArea):
         root.addWidget(_label("Изменения применяются после перезапуска приложения.", size=11, color=TEXT_MUTED))
 
         # --- Проверка подключений ---
+        # Zabbix/Oxidized здесь сознательно НЕТ: проверять их с десктопа
+        # бессмысленно — доступ к ним есть только у серверной машины с
+        # туннелем, и локальная проверка всегда показывала бы «недоступно»
+        # даже при полностью здоровой системе. Их состояние берётся из
+        # heartbeat службы (карточка «Сервис реального времени» выше).
         check_card = Card(radius=18)
         check_layout = QVBoxLayout(check_card)
         check_layout.setContentsMargins(24, 20, 24, 20)
         check_layout.setSpacing(10)
-        check_layout.addWidget(_label("Проверка подключений", size=14, weight=700))
+        check_layout.addWidget(_label("Проверка подключений с этого компьютера", size=14, weight=700))
         check_layout.addWidget(_label(
-            "Проверяет доступность по текущим значениям полей выше (даже если ещё не сохранены).",
+            "Проверяет доступность по текущим значениям полей выше (даже если ещё не сохранены). "
+            "Состояние Zabbix смотрите в карточке «Сервис реального времени» — его опрашивает сервер.",
             size=11, color=TEXT_MUTED,
         ))
 
         self._check_workers: list[ConnectionCheckWorker] = []
         self._check_rows: dict[str, tuple[QLabel, QPushButton]] = {}
         services = [
-            ("zabbix", "Zabbix", self._check_zabbix),
-            ("oxidized", "Oxidized", self._check_oxidized),
             ("ollama", "Ollama (модель анализа)", self._check_ollama),
             ("embedding", "Ollama (модель эмбеддингов / RAG)", self._check_embedding),
         ]
@@ -2368,6 +2424,128 @@ class SettingsTab(QScrollArea):
 
         root.addWidget(check_card)
         root.addStretch()
+
+    # Сколько времени без обновления heartbeat считать службу «не
+    # отвечающей». Три пропущенных минутных цикла: не реагирует на один
+    # затянувшийся опрос, но быстро заметит реальное падение. Статус
+    # 'analyzing' из этого правила исключён — длинный LLM-прогон это
+    # нормальная работа, а не признак смерти (см. _refresh_service_status).
+    SERVICE_STALE_SECONDS = 180
+
+    def _build_service_status_card(self) -> Card:
+        card = Card(radius=18)
+        layout = QVBoxLayout(card)
+        layout.setContentsMargins(24, 20, 24, 20)
+        layout.setSpacing(8)
+
+        header = QHBoxLayout()
+        header.addWidget(_label("Сервис реального времени", size=14, weight=700))
+        header.addStretch()
+        refresh_btn = QPushButton("Обновить")
+        refresh_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
+        refresh_btn.clicked.connect(self._refresh_service_status)
+        header.addWidget(refresh_btn)
+        layout.addLayout(header)
+
+        layout.addWidget(_label(
+            "Опрос Zabbix и анализ через LLM выполняет фоновая служба на сервере — "
+            "независимо от того, открыто ли это приложение (см. realtime_service.py).",
+            size=11, color=TEXT_MUTED,
+        ))
+
+        self.service_state_label = _label("состояние: нет данных", size=12, weight=700, color=TEXT_MUTED)
+        layout.addWidget(self.service_state_label)
+        self.service_detail_label = _label("", size=11, color=TEXT_SECONDARY)
+        self.service_detail_label.setWordWrap(True)
+        layout.addWidget(self.service_detail_label)
+        self.service_zabbix_label = _label("", size=11, color=TEXT_SECONDARY, font=FONT_DATA)
+        self.service_zabbix_label.setWordWrap(True)
+        layout.addWidget(self.service_zabbix_label)
+
+        self._refresh_service_status()
+        return card
+
+    def _refresh_service_status(self) -> None:
+        if self.status_repo is None:
+            self._set_service_state("состояние: неизвестно", TEXT_MUTED,
+                                     "Нет подключения к общей БД — статус службы недоступен.", "")
+            return
+        try:
+            row = self.status_repo.read()
+        except Exception as e:
+            self._set_service_state("состояние: ошибка чтения", NEGATIVE, str(e)[:200], "")
+            return
+
+        if not row:
+            self._set_service_state(
+                "состояние: служба ни разу не запускалась", WARNING,
+                "В общей БД нет ни одной отметки от службы. Запустите realtime_service.py "
+                "на сервере (см. DEPLOYMENT.md) — без неё новые алерты из Zabbix не появятся.",
+                "",
+            )
+            return
+
+        updated_at = row.get("updated_at")
+        status = (row.get("status") or "").lower()
+        age_seconds = (datetime.now() - updated_at).total_seconds() if updated_at else None
+        stale = age_seconds is not None and age_seconds > self.SERVICE_STALE_SECONDS
+
+        if status == "stopped":
+            state_text, color = "состояние: остановлена", WARNING
+        elif status == "error":
+            state_text, color = "состояние: ошибка в цикле опроса", NEGATIVE
+        elif status == "analyzing":
+            # Длинный LLM-прогон — штатная работа, даже если отметка «старая».
+            state_text, color = "состояние: идёт анализ через LLM", POSITIVE
+        elif stale:
+            state_text, color = "состояние: не отвечает", NEGATIVE
+        else:
+            state_text, color = "состояние: работает", POSITIVE
+
+        parts = []
+        if row.get("message"):
+            parts.append(row["message"])
+        if updated_at:
+            parts.append(f"отметка {_relative_time(updated_at)}")
+        if row.get("last_poll_at"):
+            parts.append(f"последний опрос {_relative_time(row['last_poll_at'])}")
+        parts.append(
+            f"за последний цикл: новых {row.get('last_new') or 0}, "
+            f"закрыто {row.get('last_closed') or 0}, повтор {row.get('last_retried') or 0}"
+        )
+        if row.get("service_host"):
+            parts.append(f"сервер: {row['service_host']}")
+        detail = " · ".join(parts)
+        if stale and status != "analyzing":
+            detail += (
+                f"\nОтметки нет дольше {self.SERVICE_STALE_SECONDS // 60} мин — проверьте службу "
+                "на сервере (services.msc) и её лог realtime.log."
+            )
+
+        zabbix_ok = row.get("zabbix_ok")
+        if zabbix_ok is None:
+            zabbix_text = "Zabbix: статус ещё не определён"
+        elif zabbix_ok:
+            zabbix_text = "Zabbix: доступен серверу ✓"
+        else:
+            zabbix_text = f"Zabbix: недоступен серверу ✗ — {row.get('zabbix_message') or 'без подробностей'}"
+
+        self._set_service_state(state_text, color, detail, zabbix_text,
+                                 zabbix_ok=zabbix_ok)
+
+    def _set_service_state(self, state_text: str, color: str, detail: str, zabbix_text: str,
+                            zabbix_ok=None) -> None:
+        self.service_state_label.setText(state_text)
+        self.service_state_label.setStyleSheet(
+            f"color: {color}; font-size: 12px; font-weight: 700; border: none; background: transparent;"
+        )
+        self.service_detail_label.setText(detail)
+        self.service_zabbix_label.setText(zabbix_text)
+        zabbix_color = TEXT_SECONDARY if zabbix_ok is None else (POSITIVE if zabbix_ok else NEGATIVE)
+        self.service_zabbix_label.setStyleSheet(
+            f"color: {zabbix_color}; font-size: 11px; font-family: {FONT_DATA}; "
+            f"border: none; background: transparent;"
+        )
 
     def _shutdown(self) -> None:
         for worker in self._check_workers:
@@ -2392,22 +2570,6 @@ class SettingsTab(QScrollArea):
             f"color: {POSITIVE if ok else NEGATIVE}; font-size: 11px; border: none; background: transparent;"
         )
         check_btn.setEnabled(True)
-
-    def _check_zabbix(self):
-        try:
-            client = ZabbixClient(self.zabbix_url.text(), self.zabbix_user.text(), self.zabbix_password.text())
-            ok = client.test_connection()
-            return ok, ("подключение успешно" if ok else "не удалось получить версию API")
-        except Exception as e:
-            return False, str(e)[:150]
-
-    def _check_oxidized(self):
-        try:
-            client = OxidizedClient(self.oxidized_url.text())
-            nodes = client.get_nodes()
-            return True, f"{len(nodes)} устройств"
-        except Exception as e:
-            return False, str(e)[:150]
 
     def _check_ollama(self):
         try:
@@ -2483,15 +2645,21 @@ class SettingsTab(QScrollArea):
         )
 
     def _save(self):
+        # Серверные поля (Zabbix/Oxidized) берём из БД заново, а НЕ из
+        # показанных полей: они только для чтения, и их мог только что
+        # обновить сервис из своего service_config.json — сохранять поверх
+        # то, что было отрисовано при открытии окна, значило бы затирать
+        # свежие серверные значения устаревшей копией.
+        current = self.settings_manager.load()
         settings = AppSettings(
-            zabbix_url=self.zabbix_url.text(),
-            zabbix_user=self.zabbix_user.text(),
-            zabbix_password=self.zabbix_password.text(),
-            oxidized_url=self.oxidized_url.text(),
+            zabbix_url=current.zabbix_url,
+            zabbix_user=current.zabbix_user,
+            zabbix_password=current.zabbix_password,
+            oxidized_url=current.oxidized_url,
             ollama_host=self.ollama_host.text(),
             ollama_model=self.ollama_model.text(),
             embedding_model=self.embedding_model.text(),
-            use_synthetic_data=self.settings_manager.load().use_synthetic_data,
+            use_synthetic_data=current.use_synthetic_data,
         )
         self.settings_manager.save(settings)
         info_box(self, "Настройки", "Сохранено. Перезапустите приложение для применения.")
@@ -3583,7 +3751,7 @@ class Toast(QWidget):
 class MainWindow(QMainWindow):
     def __init__(self, incident_repo, config_repo, settings_manager: SettingsManager,
                  zabbix_client, oxidized_client, analyzer, incident_rag=None, config_rag=None,
-                 offline_mode: bool = False):
+                 offline_mode: bool = False, status_repo=None):
         super().__init__()
         self.setWindowTitle("NetAI Monitor — интеллектуальный анализ сетевой инфраструктуры")
         self.setWindowIcon(app_icon())
@@ -3613,7 +3781,8 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.dashboard_tab)
         self.stack.addWidget(self.alerts_tab)
         self.stack.addWidget(self.configs_tab)
-        self.stack.addWidget(SettingsTab(settings_manager, offline_mode=offline_mode))
+        self.stack.addWidget(SettingsTab(settings_manager, offline_mode=offline_mode,
+                                          status_repo=status_repo))
         self.stack.addWidget(SyntheticDataTab(settings_manager, incident_repo, config_repo,
                                                incident_rag=incident_rag, config_rag=config_rag,
                                                offline_mode=offline_mode))
@@ -3689,7 +3858,8 @@ class MainWindow(QMainWindow):
 
 
 def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbix_client,
-            oxidized_client, analyzer, incident_rag=None, config_rag=None, offline_mode: bool = False):
+            oxidized_client, analyzer, incident_rag=None, config_rag=None, offline_mode: bool = False,
+            status_repo=None):
     app = QApplication.instance() or QApplication([])
     load_bundled_fonts()
     # Fusion — кроссплатформенный стиль, полностью отрисовываемый через QSS.
@@ -3705,6 +3875,6 @@ def run_app(incident_repo, config_repo, settings_manager: SettingsManager, zabbi
     app.setWindowIcon(app_icon())
     window = MainWindow(incident_repo, config_repo, settings_manager, zabbix_client, oxidized_client,
                          analyzer, incident_rag=incident_rag, config_rag=config_rag,
-                         offline_mode=offline_mode)
+                         offline_mode=offline_mode, status_repo=status_repo)
     window.showMaximized()
     app.exec()

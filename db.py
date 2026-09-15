@@ -76,6 +76,27 @@ CREATE TABLE IF NOT EXISTS app_settings (
     key             TEXT PRIMARY KEY,
     value           TEXT
 );
+
+-- Одна строка (id=1) со статусом фонового сервиса реального времени.
+-- Через неё десктоп-клиенты видят, живёт ли служба на сервере и доступен
+-- ли ей Zabbix — сами они к Zabbix подключиться не могут (туннель есть
+-- только у серверной машины), поэтому локальная проверка подключения с
+-- десктопа бессмысленна, а эти данные приходят от того, кто реально
+-- опрашивает Zabbix.
+CREATE TABLE IF NOT EXISTS service_heartbeat (
+    id              INTEGER PRIMARY KEY,
+    updated_at      TIMESTAMP NOT NULL,
+    status          TEXT NOT NULL,
+    message         TEXT,
+    zabbix_ok       BOOLEAN,
+    zabbix_message  TEXT,
+    last_poll_at    TIMESTAMP,
+    last_new        INTEGER,
+    last_closed     INTEGER,
+    last_retried    INTEGER,
+    service_host    TEXT,
+    pid             INTEGER
+);
 """
 
 DEFAULT_SETTINGS = {
@@ -135,6 +156,52 @@ class SettingsRepository:
     def set_many(self, values: dict) -> None:
         for key, value in values.items():
             self.set(key, value)
+
+
+class ServiceStatusRepository:
+    """Статус фонового сервиса реального времени — единственная строка
+    (id=1), которую пишет realtime_service.py и читает GUI (см.
+    SettingsTab: карточка «Сервис реального времени»)."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def write(self, status: str, message: str = "", zabbix_ok: bool | None = None,
+              zabbix_message: str = "", last_poll_at=None, last_new: int = 0,
+              last_closed: int = 0, last_retried: int = 0,
+              service_host: str = "", pid: int = 0) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO service_heartbeat
+                    (id, updated_at, status, message, zabbix_ok, zabbix_message,
+                     last_poll_at, last_new, last_closed, last_retried, service_host, pid)
+                    VALUES (1, now(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (id) DO UPDATE SET
+                        updated_at = now(),
+                        status = EXCLUDED.status,
+                        message = EXCLUDED.message,
+                        zabbix_ok = EXCLUDED.zabbix_ok,
+                        zabbix_message = EXCLUDED.zabbix_message,
+                        last_poll_at = COALESCE(EXCLUDED.last_poll_at, service_heartbeat.last_poll_at),
+                        last_new = EXCLUDED.last_new,
+                        last_closed = EXCLUDED.last_closed,
+                        last_retried = EXCLUDED.last_retried,
+                        service_host = EXCLUDED.service_host,
+                        pid = EXCLUDED.pid
+                    """,
+                    (status, message, zabbix_ok, zabbix_message, last_poll_at,
+                     last_new, last_closed, last_retried, service_host, pid),
+                )
+            conn.commit()
+
+    def read(self) -> dict | None:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM service_heartbeat WHERE id = 1")
+                row = cur.fetchone()
+        return dict(row) if row else None
 
 
 class IncidentRepository:

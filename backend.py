@@ -9,6 +9,13 @@ backend.py — выбор хранилища при запуске прилож�
 отключается (нет pgvector), но сама программа, синтетические данные,
 Zabbix/Oxidized-моки и Ollama-анализ (если Ollama установлена) работают
 как обычно.
+
+ВАЖНО про фоновый сервис: откат на SQLite уместен только для десктоп-
+клиента (лучше работать локально, чем не работать вовсе). Для
+realtime_service.py он был бы вреден — служба молча писала бы результаты
+анализа в локальный файл, которого не видит ни один клиент. Поэтому у
+службы своя точка входа: create_postgres_backend(), которая НЕ откатывается,
+а бросает исключение, чтобы служба могла подождать и повторить попытку.
 """
 from __future__ import annotations
 
@@ -18,35 +25,55 @@ from typing import Tuple
 from local_config import load_postgres_config, build_dsn
 
 
-def _resolve_dsn() -> str:
-    # NETAI_DB_DSN — явный оверрайд для CI/скриптов/тех, кто предпочитает
-    # переменные окружения; без неё используется то, что сохранено через GUI.
-    return os.environ.get("NETAI_DB_DSN") or build_dsn(load_postgres_config())
+def _resolve_dsn(explicit_dsn: str | None = None) -> str:
+    # Приоритет: явно переданный DSN (из service_config.json у службы) >
+    # NETAI_DB_DSN (оверрайд для CI/скриптов и для службы Windows, у которой
+    # своя учётная запись и свой профиль) > то, что сохранено через GUI.
+    return explicit_dsn or os.environ.get("NETAI_DB_DSN") or build_dsn(load_postgres_config())
 
 
-def create_backend() -> Tuple[object, object, object, object, bool]:
-    """Возвращает (db, incident_repo, config_repo, settings_repo, is_postgres)."""
+def create_postgres_backend(dsn: str | None = None) -> Tuple[object, object, object, object, object]:
+    """Строго PostgreSQL, без отката на SQLite. Бросает исключение, если
+    подключиться не удалось — вызывающий код (служба) решает, подождать и
+    повторить или завершиться.
+
+    Возвращает (db, incident_repo, config_repo, settings_repo, status_repo)."""
+    from db import (
+        Database, IncidentRepository, ConfigDiffRepository, SettingsRepository,
+        ServiceStatusRepository,
+    )
+
+    db = Database(dsn=_resolve_dsn(dsn))
+    settings_repo = SettingsRepository(db)
+    # Простой запрос, чтобы убедиться, что подключение реально рабочее.
+    settings_repo.get_all()
+    return (
+        db,
+        IncidentRepository(db),
+        ConfigDiffRepository(db),
+        settings_repo,
+        ServiceStatusRepository(db),
+    )
+
+
+def create_backend() -> Tuple[object, object, object, object, object, bool]:
+    """Возвращает (db, incident_repo, config_repo, settings_repo, status_repo, is_postgres)."""
     try:
-        from db import Database, IncidentRepository, ConfigDiffRepository, SettingsRepository
-
-        db = Database(dsn=_resolve_dsn())
-        incident_repo = IncidentRepository(db)
-        config_repo = ConfigDiffRepository(db)
-        settings_repo = SettingsRepository(db)
-        # Простой запрос, чтобы проверить, что подключение реально рабочее —
-        # Database._init_schema() уже должен был на этом упасть, если БД
-        # недоступна, но перестраховка не помешает.
-        settings_repo.get_all()
-        return db, incident_repo, config_repo, settings_repo, True
+        db, incident_repo, config_repo, settings_repo, status_repo = create_postgres_backend()
+        return db, incident_repo, config_repo, settings_repo, status_repo, True
     except Exception as e:
         print(f"[backend] PostgreSQL недоступен ({e}) — переключаюсь на локальный SQLite-режим.")
         from db_sqlite import (
             SQLiteDatabase, SQLiteIncidentRepository, SQLiteConfigDiffRepository,
-            SQLiteSettingsRepository,
+            SQLiteSettingsRepository, SQLiteServiceStatusRepository,
         )
 
         db = SQLiteDatabase()
-        incident_repo = SQLiteIncidentRepository(db)
-        config_repo = SQLiteConfigDiffRepository(db)
-        settings_repo = SQLiteSettingsRepository(db)
-        return db, incident_repo, config_repo, settings_repo, False
+        return (
+            db,
+            SQLiteIncidentRepository(db),
+            SQLiteConfigDiffRepository(db),
+            SQLiteSettingsRepository(db),
+            SQLiteServiceStatusRepository(db),
+            False,
+        )
