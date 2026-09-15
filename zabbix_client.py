@@ -90,20 +90,29 @@ class ZabbixClient(BaseZabbixClient):
             raise ConnectionError(f"Zabbix недоступен: {e}") from e
 
         try:
+            # У problem.get (в отличие от event.get/trigger.get) нет
+            # select*-параметров для связанных объектов вообще — попытка
+            # передать selectHosts падает с "unexpected parameter selectHosts"
+            # (проверено на реальном Zabbix 7.0.10). Хост и item_key достаём
+            # отдельным trigger.get по objectid (=triggerid) проблем —
+            # trigger.get эти select-параметры честно поддерживает.
             problems = self.zapi.problem.get(
                 output="extend",
-                selectHosts=["host"],
                 sortfield=["eventid"],
                 sortorder="DESC",
                 limit=limit,
             )
             trigger_ids = list({p["objectid"] for p in problems if p.get("objectid")})
+            host_by_trigger = {}
             item_key_by_trigger = {}
             if trigger_ids:
                 triggers = self.zapi.trigger.get(
-                    triggerids=trigger_ids, output=["triggerid"], selectItems=["key_"],
+                    triggerids=trigger_ids, output=["triggerid"],
+                    selectHosts=["host"], selectItems=["key_"],
                 )
                 for t in triggers:
+                    hosts = t.get("hosts") or []
+                    host_by_trigger[t["triggerid"]] = hosts[0]["host"] if hosts else "unknown"
                     items = t.get("items") or []
                     item_key_by_trigger[t["triggerid"]] = items[0]["key_"] if items else ""
         except Exception as e:
@@ -112,15 +121,15 @@ class ZabbixClient(BaseZabbixClient):
 
         incidents = []
         for p in problems:
-            host_name = p["hosts"][0]["host"] if p.get("hosts") else "unknown"
+            trigger_id = p.get("objectid", "")
             incidents.append(
                 Incident(
                     id=p["eventid"],
-                    host=host_name,
+                    host=host_by_trigger.get(trigger_id, "unknown"),
                     problem_name=p["name"],
                     severity=Severity(int(p["severity"])),
                     timestamp=datetime.fromtimestamp(int(p["clock"])),
-                    item_key=item_key_by_trigger.get(p.get("objectid", ""), ""),
+                    item_key=item_key_by_trigger.get(trigger_id, ""),
                 )
             )
         return incidents
