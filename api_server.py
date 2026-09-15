@@ -272,6 +272,22 @@ def set_config_resolution(config_id: int, body: ResolutionRequest, user: dict = 
     return {"ok": True}
 
 
+@app.delete("/incidents")
+def clear_incidents(user: dict = Depends(require_admin)):
+    # Разрушительно и необратимо (используется только в SyntheticDataTab для
+    # сброса демо-данных перед повторной генерацией) — поэтому только admin.
+    deleted = backend.incidents.clear_all()
+    log.warning("Администратор %s удалил все инциденты (%d записей).", user["username"], deleted)
+    return {"deleted": deleted}
+
+
+@app.delete("/configs")
+def clear_configs(user: dict = Depends(require_admin)):
+    deleted = backend.configs.clear_all()
+    log.warning("Администратор %s удалил все проверки конфигураций (%d записей).", user["username"], deleted)
+    return {"deleted": deleted}
+
+
 # ---------------------------------------------------------------------------
 # Чат — единственная LLM-операция, которую сама API-служба выполняет
 # синхронно (не через очередь): ответ обычно укладывается в разумное время,
