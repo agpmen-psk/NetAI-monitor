@@ -13,9 +13,12 @@ AlertsTab, поэтому анализ происходил только пок�
 """
 from __future__ import annotations
 
+import logging
 from typing import List
 
 from models import Incident
+
+log = logging.getLogger(__name__)
 
 
 class RealtimeEngine:
@@ -60,7 +63,9 @@ class RealtimeEngine:
         if not self._seeded:
             self.seed()
 
+        log.info("Опрашиваю Zabbix...")
         fetched: List[Incident] = self.zabbix_client.get_active_problems()
+        log.info("Zabbix вернул %d активных проблем.", len(fetched))
         fetched_ids = {i.id for i in fetched}
         self._polled_ids |= fetched_ids
 
@@ -82,6 +87,17 @@ class RealtimeEngine:
 
         to_analyze = new_incidents + retry_incidents
         if to_analyze:
+            # Без этого лога первый прогон на непустом Zabbix выглядит как
+            # зависание: между "Zabbix вернул N проблем" и следующим логом
+            # сервиса могли молча пройти много минут — LLM на локальной
+            # модели анализирует пачками по BATCH_SIZE, и каждая пачка
+            # может идти десятки секунд, а весь обмен с Zabbix/Ollama
+            # логируется только на уровне DEBUG внутри их библиотек.
+            log.info(
+                "Начинаю анализ через LLM: новых %d, повтор %d (всего %d) — "
+                "это может занять время на локальной модели...",
+                len(new_incidents), len(retry_incidents), len(to_analyze),
+            )
             self.analyzer.analyze(to_analyze, rag=self.rag)
             self.repo.save_incidents(to_analyze)
             if self.rag is not None:

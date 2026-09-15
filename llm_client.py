@@ -5,6 +5,7 @@ llm_client.py — интеллектуальный анализ ТОЛЬКО ч�
 """
 from __future__ import annotations
 
+import logging
 import re
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -12,6 +13,8 @@ from datetime import timedelta
 from typing import List
 
 from models import Incident, Severity
+
+log = logging.getLogger(__name__)
 
 # Инциденты на одном хосте, случившиеся в пределах этого окна друг от друга,
 # считаются одной группой (вероятно один и тот же первопричинный отказ) —
@@ -233,7 +236,14 @@ class OllamaAnalyzer(BaseAnalyzer):
         похожие прошлые случаи с их фактическими решениями."""
         if not incidents:
             return incidents
-        for start in range(0, len(incidents), self.BATCH_SIZE):
+        total_batches = (len(incidents) + self.BATCH_SIZE - 1) // self.BATCH_SIZE
+        for batch_num, start in enumerate(range(0, len(incidents), self.BATCH_SIZE), start=1):
+            # Локальная модель может отвечать медленно — без этого лога
+            # долгий первый прогон на большом количестве инцидентов (первый
+            # опрос на непустом Zabbix, например) выглядит как зависание:
+            # сам HTTP-вызов к Ollama логируется только на уровне DEBUG.
+            if total_batches > 1:
+                log.info("LLM: пачка %d из %d...", batch_num, total_batches)
             self._analyze_batch(incidents[start:start + self.BATCH_SIZE], rag)
         return incidents
 
