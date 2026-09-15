@@ -173,28 +173,71 @@ class IncidentRepository:
                     )
             conn.commit()
 
+    _ROW_COLUMNS = (
+        "id, host, problem_name, severity, timestamp, item_key, "
+        "last_value, ai_summary, ai_recommendation, ai_verified, resolution, "
+        "resolved_at, opened_at"
+    )
+
+    @staticmethod
+    def _row_to_incident(r) -> Incident:
+        return Incident(
+            id=r[0], host=r[1], problem_name=r[2], severity=Severity(r[3]),
+            timestamp=r[4], item_key=r[5] or "", last_value=r[6] or "",
+            ai_summary=r[7] or "", ai_recommendation=r[8] or "",
+            ai_analyzed=bool(r[7]), ai_verified=bool(r[9]), resolution=r[10] or "",
+            resolved_at=r[11], opened_at=r[12],
+        )
+
     def get_history(self, limit: int = 200) -> List[Incident]:
         with self.db._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT id, host, problem_name, severity, timestamp, item_key, "
-                    "last_value, ai_summary, ai_recommendation, ai_verified, resolution, "
-                    "resolved_at, opened_at FROM incidents "
-                    "ORDER BY timestamp DESC LIMIT %s",
+                    f"SELECT {self._ROW_COLUMNS} FROM incidents ORDER BY timestamp DESC LIMIT %s",
                     (limit,),
                 )
                 rows = cur.fetchall()
+        return [self._row_to_incident(r) for r in rows]
 
-        return [
-            Incident(
-                id=r[0], host=r[1], problem_name=r[2], severity=Severity(r[3]),
-                timestamp=r[4], item_key=r[5] or "", last_value=r[6] or "",
-                ai_summary=r[7] or "", ai_recommendation=r[8] or "",
-                ai_analyzed=bool(r[7]), ai_verified=bool(r[9]), resolution=r[10] or "",
-                resolved_at=r[11], opened_at=r[12],
-            )
-            for r in rows
-        ]
+    def get_existing_ids(self, ids: List[str]) -> set:
+        """Какие из переданных id уже есть в БД — используется реальным
+        временем (realtime_engine.py) для отличения новых инцидентов от уже
+        известных без загрузки всей истории в память (см. get_unanalyzed/
+        get_open_ids — раньше всё это делалось Python-фильтром по
+        get_history(limit=5000), что переставало видеть записи старше этого
+        окна, стоило БД расти)."""
+        if not ids:
+            return set()
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM incidents WHERE id = ANY(%s)", (ids,))
+                return {r[0] for r in cur.fetchall()}
+
+    def get_open_ids(self) -> set:
+        """Все сейчас открытые (resolved_at IS NULL) id — без ограничения
+        на количество, иначе старый ещё активный инцидент вне окна
+        get_history(limit=N) никогда не смог бы быть закрыт."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT id FROM incidents WHERE resolved_at IS NULL")
+                return {r[0] for r in cur.fetchall()}
+
+    def get_unanalyzed(self, limit: int = 20) -> List[Incident]:
+        """Инциденты без анализа (ai_summary пуст) — САМЫЕ СТАРЫЕ сначала.
+        Раньше повтор анализа брал 20 самых свежих неанализированных из
+        get_history(limit=5000) — при устойчивом сбое LLM новые проблемные
+        пачки постоянно вытесняли старые из повторной попытки, и те
+        застревали без анализа навсегда."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"SELECT {self._ROW_COLUMNS} FROM incidents "
+                    "WHERE ai_summary IS NULL OR ai_summary = '' "
+                    "ORDER BY timestamp ASC LIMIT %s",
+                    (limit,),
+                )
+                rows = cur.fetchall()
+        return [self._row_to_incident(r) for r in rows]
 
     def mark_resolved(self, ids: List[str]) -> None:
         """Проставляет resolved_at тем алертам из списка, которые ещё не были
@@ -262,10 +305,17 @@ class IncidentRepository:
                     "FROM incidents WHERE ai_verified = TRUE"
                 )
                 verified_count, avg_seconds = cur.fetchone()
+                # Настоящий счётчик проанализированных по всей таблице — раньше
+                # DashboardTab считал это как sum(ai_analyzed) по get_history(limit=200),
+                # что молча занижало и total, и процент, как только история
+                # переросла 200 записей.
+                cur.execute("SELECT COUNT(*) FROM incidents WHERE ai_summary IS NOT NULL AND ai_summary != ''")
+                analyzed_count = cur.fetchone()[0]
         return {
             "total": total,
             "verified_count": verified_count or 0,
             "avg_seconds": float(avg_seconds) if avg_seconds is not None else 0.0,
+            "analyzed_count": analyzed_count,
         }
 
     def get_stats_by_host(self) -> dict:
@@ -275,6 +325,42 @@ class IncidentRepository:
                     "SELECT host, COUNT(*) FROM incidents GROUP BY host ORDER BY COUNT(*) DESC"
                 )
                 return dict(cur.fetchall())
+
+    def get_critical_count(self) -> int:
+        """Для chat_query.py — честное 'по всей истории' вместо подсчёта по
+        обрезанному списку. Severity.HIGH=4, Severity.DISASTER=5."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM incidents WHERE severity IN (4, 5)")
+                return cur.fetchone()[0]
+
+    def get_distinct_hosts(self) -> List[str]:
+        """Все имена хостов, встречавшиеся в истории — для chat_query.py
+        (распознавание хоста в вопросе): раньше список хостов строился из
+        get_history(limit=5000), так что хост, все инциденты которого старше
+        первых 5000 строк, вообще не распознавался бы в тексте вопроса."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT host FROM incidents")
+                return [r[0] for r in cur.fetchall()]
+
+    def search(self, since, host: str | None = None, limit: int = 5000) -> List[Incident]:
+        """Фильтрация по дате/хосту в самой БД (а не Python-фильтром по уже
+        обрезанному get_history(limit=N)) — для chat_query.py, где иначе
+        совпадения старше первых N строк истории просто не находились бы,
+        даже если реально существуют."""
+        query = f"SELECT {self._ROW_COLUMNS} FROM incidents WHERE timestamp >= %s"
+        params: list = [since]
+        if host:
+            query += " AND host = %s"
+            params.append(host)
+        query += " ORDER BY timestamp DESC LIMIT %s"
+        params.append(limit)
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = cur.fetchall()
+        return [self._row_to_incident(r) for r in rows]
 
     def clear_all(self) -> int:
         with self.db._connect() as conn:
@@ -332,6 +418,40 @@ class ConfigDiffRepository:
                     "WHERE embedding IS NULL AND ai_summary IS NOT NULL LIMIT %s",
                     (limit,),
                 )
+                return list(cur.fetchall())
+
+    def get_risk_counts(self) -> dict:
+        """Для chat_query.py — честное 'по всей истории' вместо подсчёта по
+        обрезанному списку."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT COALESCE(UPPER(ai_risk_level), 'UNKNOWN'), COUNT(*) "
+                    "FROM config_diffs GROUP BY 1"
+                )
+                return dict(cur.fetchall())
+
+    def get_distinct_nodes(self) -> List[str]:
+        """Для chat_query.py — см. IncidentRepository.get_distinct_hosts,
+        тот же смысл: не терять распознавание узла в тексте вопроса из-за
+        обрезки get_history(limit=N)."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT DISTINCT node FROM config_diffs")
+                return [r[0] for r in cur.fetchall()]
+
+    def search(self, since, node: str | None = None, limit: int = 5000) -> List[dict]:
+        """Фильтрация по дате/узлу в самой БД — см. IncidentRepository.search."""
+        query = "SELECT * FROM config_diffs WHERE saved_at >= %s"
+        params: list = [since]
+        if node:
+            query += " AND node = %s"
+            params.append(node)
+        query += " ORDER BY saved_at DESC LIMIT %s"
+        params.append(limit)
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(query, params)
                 return list(cur.fetchall())
 
     def update_correction(self, row_id: int, resolution: str) -> None:

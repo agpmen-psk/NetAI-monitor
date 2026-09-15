@@ -40,7 +40,9 @@ from zabbix_client import MockZabbixClient, ZabbixClient
 from mock_oxidized_client import MockOxidizedClient
 from oxidized_client import OxidizedClient
 from rag import EmbeddingClient
-from local_config import load_postgres_config, save_postgres_config, build_dsn, load_theme, save_theme
+from local_config import (
+    load_postgres_config, save_postgres_config, build_dsn, load_theme, save_theme, DEFAULTS as PG_DEFAULTS,
+)
 from chat_query import build_context as build_chat_context
 
 # ---------------------------------------------------------------------------
@@ -1054,6 +1056,23 @@ class ChatWorker(QThread):
             self.error.emit(str(e))
 
 
+def _disconnect_worker(worker: QThread) -> None:
+    """Отключает finished/error у уже запущенного воркера перед закрытием
+    приложения — без этого MainWindow не останавливал ни один фоновый поток
+    при закрытии окна: воркер, завершившийся уже ПОСЛЕ того, как виджеты
+    вкладки уничтожены сборщиком Qt, всё равно пытался вызвать их слоты
+    (например, self._load_history()) на мёртвом объекте. Сам поток это не
+    прерывает (у него нет кооперативной отмены), но результат уже никого не
+    трогает."""
+    for signal_name in ("finished", "error"):
+        signal = getattr(worker, signal_name, None)
+        if signal is not None:
+            try:
+                signal.disconnect()
+            except (TypeError, RuntimeError):
+                pass  # не было подключено или воркер уже уничтожен
+
+
 class ComparisonDialog(QDialog):
     """Модальное окно «с RAG / без RAG»: слева — что именно RAG подмешал в
     промпт, справа — два реальных ответа модели для прямого сравнения."""
@@ -1177,14 +1196,20 @@ class DashboardTab(QScrollArea):
         _clear_layout(self.pipeline_slot)
         _clear_layout(self.bottom_row)
 
-        total = len(incidents)
+        # Настоящие total/analyzed — агрегатами по всей таблице (get_verification_stats),
+        # а не по обрезанным 200 последним записям. Раньше total=len(incidents) и
+        # analyzed=sum(ai_analyzed) молча занижались, как только история переросла
+        # 200 строк — тот же класс проблемы уже был учтён в AnalyticsTab, здесь не был.
+        stats = self.incident_repo.get_verification_stats()
+        total = stats["total"]
+        analyzed = stats["analyzed_count"]
+        analyzed_pct = (analyzed / total * 100) if total else 0.0
+
         critical_24h = sum(
             1 for i in incidents
             if i.severity in (Severity.HIGH, Severity.DISASTER)
             and (datetime.now() - i.timestamp) <= timedelta(hours=24)
         )
-        analyzed = sum(1 for i in incidents if i.ai_analyzed)
-        analyzed_pct = (analyzed / total * 100) if total else 0.0
 
         hourly = _hourly_counts(incidents)
         weekly_configs = _weekly_config_counts(configs)
@@ -1286,6 +1311,7 @@ class AlertsTab(QWidget):
         self.repo = repo
         self.rag = rag
         self._live_workers: list[QThread] = []
+        self._compare_workers: list[QThread] = []
         self._unread_ids: set[str] = set()
         self._show_closed = False
         root = QVBoxLayout(self)
@@ -1415,6 +1441,12 @@ class AlertsTab(QWidget):
         self._seen_ids = {inc.id for inc in self._all_incidents}
 
         self._db_refresh_timer.start(self.DB_REFRESH_INTERVAL_MS)
+
+    def _shutdown(self) -> None:
+        """Вызывается MainWindow.closeEvent при закрытии приложения."""
+        self._db_refresh_timer.stop()
+        for worker in self._live_workers + self._compare_workers:
+            _disconnect_worker(worker)
 
     def _load_history(self):
         self._all_incidents = self.repo.get_history()
@@ -1699,7 +1731,12 @@ class AlertsTab(QWidget):
         worker = ComparisonWorker(lambda: self._comparison_task(inc))
         worker.finished.connect(lambda result: self._on_comparison_finished(worker, result))
         worker.error.connect(lambda msg: self._on_comparison_error(worker, msg))
-        self._live_workers.append(worker)
+        # Отдельный список, НЕ _live_workers — тот используется как "занято"
+        # для 10-секундного автообновления/ручной кнопки; сравнение (два
+        # последовательных вызова Ollama) может идти десятки секунд и раньше
+        # незаметно для оператора блокировало автообновление списка на всё
+        # это время.
+        self._compare_workers.append(worker)
         worker.start()
 
     def _comparison_task(self, inc: Incident) -> dict:
@@ -1724,16 +1761,16 @@ class AlertsTab(QWidget):
         }
 
     def _on_comparison_finished(self, worker: ComparisonWorker, result: dict):
-        if worker in self._live_workers:
-            self._live_workers.remove(worker)
+        if worker in self._compare_workers:
+            self._compare_workers.remove(worker)
         self.compare_btn.setEnabled(True)
         self.compare_btn.setText("Сравнить: с RAG / без RAG")
         dialog = ComparisonDialog(result, parent=self)
         dialog.exec()
 
     def _on_comparison_error(self, worker: ComparisonWorker, message: str):
-        if worker in self._live_workers:
-            self._live_workers.remove(worker)
+        if worker in self._compare_workers:
+            self._compare_workers.remove(worker)
         self.compare_btn.setEnabled(True)
         self.compare_btn.setText("Сравнить: с RAG / без RAG")
         warn_box(self, "Ошибка сравнения", message)
@@ -1864,6 +1901,10 @@ class ConfigsTab(QWidget):
 
         self._load_history()
 
+    def _shutdown(self) -> None:
+        for worker in self._live_workers:
+            _disconnect_worker(worker)
+
     def _reload_devices(self):
         self.device_selector.clear()
         self.device_selector.addItem(self.ALL_DEVICES)
@@ -1983,6 +2024,9 @@ class ConfigsTab(QWidget):
             self._live_workers.remove(worker)
         self._save_results(results)
         self._load_history()
+        if self.list_widget.count():
+            self.list_widget.setCurrentRow(0)
+            self._on_select(self.list_widget.item(0))
         self._reset_bulk_buttons()
         self.config_added.emit()
 
@@ -2198,6 +2242,17 @@ class SettingsTab(QScrollArea):
             pg_form.addRow(_label(label, size=12, color=TEXT_SECONDARY), widget)
         pg_layout.addLayout(pg_form)
 
+        self.pg_default_password_warning = _label(
+            "⚠ Используются логин и пароль PostgreSQL по умолчанию (postgres/postgres) — "
+            "смените их перед вводом в эксплуатацию.",
+            size=11, color=WARNING, weight=700,
+        )
+        self.pg_default_password_warning.setWordWrap(True)
+        self.pg_default_password_warning.setVisible(
+            pg_config["user"] == PG_DEFAULTS["user"] and pg_config["password"] == PG_DEFAULTS["password"]
+        )
+        pg_layout.addWidget(self.pg_default_password_warning)
+
         pg_action_row = QHBoxLayout()
         pg_check_btn = QPushButton("Проверить подключение")
         pg_check_btn.setStyleSheet(SECONDARY_BUTTON_STYLE)
@@ -2314,6 +2369,10 @@ class SettingsTab(QScrollArea):
         root.addWidget(check_card)
         root.addStretch()
 
+    def _shutdown(self) -> None:
+        for worker in self._check_workers:
+            _disconnect_worker(worker)
+
     def _run_check(self, key: str, check_fn) -> None:
         status_label, check_btn = self._check_rows[key]
         check_btn.setEnabled(False)
@@ -2401,7 +2460,11 @@ class SettingsTab(QScrollArea):
         )
 
     def _save_postgres_config(self):
-        save_postgres_config(self._current_pg_config())
+        config = self._current_pg_config()
+        save_postgres_config(config)
+        self.pg_default_password_warning.setVisible(
+            config["user"] == PG_DEFAULTS["user"] and config["password"] == PG_DEFAULTS["password"]
+        )
         info_box(
             self, "PostgreSQL",
             "Параметры подключения сохранены. Перезапустите приложение — оно "
@@ -2534,6 +2597,10 @@ class SyntheticDataTab(QWidget):
 
         root.addWidget(danger_card)
         root.addStretch()
+
+    def _shutdown(self) -> None:
+        for worker in self._reindex_workers:
+            _disconnect_worker(worker)
 
     def _save(self):
         settings = self.settings_manager.load()
@@ -3228,6 +3295,10 @@ class ChatTab(QWidget):
         input_row.addWidget(self.send_btn)
         root.addLayout(input_row)
 
+    def _shutdown(self) -> None:
+        for worker in self._workers:
+            _disconnect_worker(worker)
+
     def _send_current(self):
         question = self.input_edit.text().strip()
         if not question:
@@ -3594,6 +3665,20 @@ class MainWindow(QMainWindow):
         super().resizeEvent(event)
         if hasattr(self, "toast") and self.toast.isVisible():
             self.toast.reposition()
+
+    def closeEvent(self, event):
+        """Без этого закрытие окна с ещё выполняющимся фоновым воркером
+        (10-секундный автообновление БД, RAG-сравнение, проверка подключений
+        и т.п.) рисковало либо предупреждением Qt "QThread destroyed while
+        still running", либо срабатыванием finished/error уже после
+        уничтожения виджетов вкладки. Сами потоки не прерываются (у них нет
+        кооперативной отмены на блокирующих сетевых вызовах) — просто
+        отключаем их сигналы, чтобы результат никого не трогал."""
+        for i in range(self.stack.count()):
+            widget = self.stack.widget(i)
+            if hasattr(widget, "_shutdown"):
+                widget._shutdown()
+        super().closeEvent(event)
 
     def _on_live_data_changed(self):
         """Срабатывает при поступлении нового алерта/конфигурации (из Центра

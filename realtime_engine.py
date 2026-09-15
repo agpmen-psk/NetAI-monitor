@@ -43,12 +43,16 @@ class RealtimeEngine:
         self._seeded = False
 
     def seed(self) -> None:
-        """Заполняет множество "уже известных активных" из истории в БД —
-        вызывается один раз при старте, чтобы существующие на момент запуска
-        активные инциденты тоже были кандидатами на закрытие, а не только
-        те, что появятся после этого момента."""
-        existing = self.repo.get_history(limit=5000)
-        self._polled_ids = {i.id for i in existing if i.resolved_at is None}
+        """Заполняет множество "уже известных активных" из БД — вызывается
+        один раз при старте, чтобы существующие на момент запуска активные
+        инциденты тоже были кандидатами на закрытие, а не только те, что
+        появятся после этого момента. get_open_ids() — без ограничения на
+        количество (раньше был get_history(limit=5000): как только суммарно
+        по таблице накапливалось больше 5000 строк — включая уже закрытые,
+        которые никогда не чистятся — по-настоящему ещё открытые старые
+        инциденты выпадали из этого окна и переставали быть видны логике
+        закрытия/повтора анализа ниже)."""
+        self._polled_ids = self.repo.get_open_ids()
         self._seeded = True
 
     def tick(self) -> dict:
@@ -60,13 +64,18 @@ class RealtimeEngine:
         fetched_ids = {i.id for i in fetched}
         self._polled_ids |= fetched_ids
 
-        known = {i.id: i for i in self.repo.get_history(limit=5000)}
-        new_incidents = [i for i in fetched if i.id not in known]
+        existing_ids = self.repo.get_existing_ids([i.id for i in fetched])
+        new_incidents = [i for i in fetched if i.id not in existing_ids]
+
+        open_ids = self.repo.get_open_ids()
         closed_ids = [
-            iid for iid, inc in known.items()
-            if inc.resolved_at is None and iid in self._polled_ids and iid not in fetched_ids
+            iid for iid in open_ids
+            if iid in self._polled_ids and iid not in fetched_ids
         ]
-        retry_incidents = [inc for inc in known.values() if not inc.ai_analyzed][: self.RETRY_LIMIT]
+        # Самые старые непроанализированные — первыми (см. get_unanalyzed),
+        # иначе при затяжном сбое LLM новые проблемные пачки на каждом тике
+        # вытесняли бы старые из окна повтора, и те застревали бы навсегда.
+        retry_incidents = self.repo.get_unanalyzed(limit=self.RETRY_LIMIT)
 
         if closed_ids:
             self.repo.mark_resolved(closed_ids)

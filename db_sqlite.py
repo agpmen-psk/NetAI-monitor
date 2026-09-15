@@ -161,26 +161,55 @@ class SQLiteIncidentRepository:
                 )
             conn.commit()
 
+    _ROW_COLUMNS = (
+        "id, host, problem_name, severity, timestamp, item_key, "
+        "last_value, ai_summary, ai_recommendation, ai_verified, resolution, "
+        "resolved_at, opened_at"
+    )
+
+    @staticmethod
+    def _row_to_incident(r) -> Incident:
+        return Incident(
+            id=r[0], host=r[1], problem_name=r[2], severity=Severity(r[3]),
+            timestamp=datetime.fromisoformat(r[4]), item_key=r[5] or "", last_value=r[6] or "",
+            ai_summary=r[7] or "", ai_recommendation=r[8] or "",
+            ai_analyzed=bool(r[7]), ai_verified=bool(r[9]), resolution=r[10] or "",
+            resolved_at=datetime.fromisoformat(r[11]) if r[11] else None,
+            opened_at=datetime.fromisoformat(r[12]) if r[12] else None,
+        )
+
     def get_history(self, limit: int = 200) -> List[Incident]:
         with self.db._connect() as conn:
             rows = conn.execute(
-                "SELECT id, host, problem_name, severity, timestamp, item_key, "
-                "last_value, ai_summary, ai_recommendation, ai_verified, resolution, "
-                "resolved_at, opened_at "
-                "FROM incidents ORDER BY timestamp DESC LIMIT ?",
+                f"SELECT {self._ROW_COLUMNS} FROM incidents ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [
-            Incident(
-                id=r[0], host=r[1], problem_name=r[2], severity=Severity(r[3]),
-                timestamp=datetime.fromisoformat(r[4]), item_key=r[5] or "", last_value=r[6] or "",
-                ai_summary=r[7] or "", ai_recommendation=r[8] or "",
-                ai_analyzed=bool(r[7]), ai_verified=bool(r[9]), resolution=r[10] or "",
-                resolved_at=datetime.fromisoformat(r[11]) if r[11] else None,
-                opened_at=datetime.fromisoformat(r[12]) if r[12] else None,
-            )
-            for r in rows
-        ]
+        return [self._row_to_incident(r) for r in rows]
+
+    def get_existing_ids(self, ids: List[str]) -> set:
+        if not ids:
+            return set()
+        with self.db._connect() as conn:
+            placeholders = ",".join("?" * len(ids))
+            rows = conn.execute(
+                f"SELECT id FROM incidents WHERE id IN ({placeholders})", ids,
+            ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_open_ids(self) -> set:
+        with self.db._connect() as conn:
+            rows = conn.execute("SELECT id FROM incidents WHERE resolved_at IS NULL").fetchall()
+        return {r[0] for r in rows}
+
+    def get_unanalyzed(self, limit: int = 20) -> List[Incident]:
+        with self.db._connect() as conn:
+            rows = conn.execute(
+                f"SELECT {self._ROW_COLUMNS} FROM incidents "
+                "WHERE ai_summary IS NULL OR ai_summary = '' "
+                "ORDER BY timestamp ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+        return [self._row_to_incident(r) for r in rows]
 
     def update_correction(self, incident_id: str, resolution: str) -> None:
         with self.db._connect() as conn:
@@ -220,6 +249,28 @@ class SQLiteIncidentRepository:
             ).fetchall()
         return dict(rows)
 
+    def get_critical_count(self) -> int:
+        with self.db._connect() as conn:
+            row = conn.execute("SELECT COUNT(*) FROM incidents WHERE severity IN (4, 5)").fetchone()
+        return row[0]
+
+    def get_distinct_hosts(self) -> List[str]:
+        with self.db._connect() as conn:
+            rows = conn.execute("SELECT DISTINCT host FROM incidents").fetchall()
+        return [r[0] for r in rows]
+
+    def search(self, since: datetime, host: str | None = None, limit: int = 5000) -> List[Incident]:
+        query = f"SELECT {self._ROW_COLUMNS} FROM incidents WHERE timestamp >= ?"
+        params: list = [since.isoformat()]
+        if host:
+            query += " AND host = ?"
+            params.append(host)
+        query += " ORDER BY timestamp DESC LIMIT ?"
+        params.append(limit)
+        with self.db._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [self._row_to_incident(r) for r in rows]
+
     def get_verification_stats(self) -> dict:
         with self.db._connect() as conn:
             total = conn.execute("SELECT COUNT(*) FROM incidents").fetchone()[0]
@@ -227,10 +278,14 @@ class SQLiteIncidentRepository:
                 "SELECT COUNT(*), AVG((julianday(saved_at) - julianday(timestamp)) * 86400.0) "
                 "FROM incidents WHERE ai_verified = 1"
             ).fetchone()
+            analyzed_count = conn.execute(
+                "SELECT COUNT(*) FROM incidents WHERE ai_summary IS NOT NULL AND ai_summary != ''"
+            ).fetchone()[0]
         return {
             "total": total,
             "verified_count": verified_count or 0,
             "avg_seconds": float(avg_seconds) if avg_seconds is not None else 0.0,
+            "analyzed_count": analyzed_count,
         }
 
     def clear_all(self) -> int:
@@ -284,6 +339,37 @@ class SQLiteConfigDiffRepository:
 
     def get_without_embedding(self, limit: int = 500) -> List[dict]:
         return []
+
+    def get_risk_counts(self) -> dict:
+        with self.db._connect() as conn:
+            rows = conn.execute(
+                "SELECT COALESCE(UPPER(ai_risk_level), 'UNKNOWN'), COUNT(*) "
+                "FROM config_diffs GROUP BY 1"
+            ).fetchall()
+        return dict(rows)
+
+    def get_distinct_nodes(self) -> List[str]:
+        with self.db._connect() as conn:
+            rows = conn.execute("SELECT DISTINCT node FROM config_diffs").fetchall()
+        return [r[0] for r in rows]
+
+    def search(self, since: datetime, node: str | None = None, limit: int = 5000) -> List[dict]:
+        query = "SELECT * FROM config_diffs WHERE saved_at >= ?"
+        params: list = [since.isoformat()]
+        if node:
+            query += " AND node = ?"
+            params.append(node)
+        query += " ORDER BY saved_at DESC LIMIT ?"
+        params.append(limit)
+        with self.db._connect() as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(query, params).fetchall()
+        results = [dict(r) for r in rows]
+        for r in results:
+            if isinstance(r.get("saved_at"), str):
+                r["saved_at"] = datetime.fromisoformat(r["saved_at"])
+            r["ai_verified"] = bool(r.get("ai_verified"))
+        return results
 
     def update_correction(self, row_id: int, resolution: str) -> None:
         with self.db._connect() as conn:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import random
 from abc import ABC, abstractmethod
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List
 
 from models import Incident, Severity
@@ -64,19 +64,26 @@ class ZabbixClient(BaseZabbixClient):
             self.zapi = None
             return False
 
-    def get_active_problems(self, limit: int = 10) -> List[Incident]:
+    def get_active_problems(self, limit: int = 500) -> List[Incident]:
         """
         Использует event.get (не problem.get!) — только у event.get есть
         параметр selectHosts, позволяющий сразу получить имя хоста.
-        source=0/object=0/value=1 — только активные триггерные проблемы.
-        limit ограничивает нагрузку на PHP-сервер Zabbix и объём для LLM.
+        source=0/object=0/value=1 — только активные триггерные проблемы,
+        этот фильтр САМ ПО СЕБЕ уже ограничивает выборку тем, что реально
+        сейчас сломано (Zabbix не может держать бесконечно много
+        одновременно активных проблем) — никакого дополнительного time_from
+        не нужно и раньше он был вреден: realtime_engine.py считает проблему
+        закрытой, если она пропала из свежего среза активных, а окно в 7
+        дней/limit=10 обрезало реально ещё активные старые/многочисленные
+        проблемы раньше, чем они закрывались в самом Zabbix — то есть
+        приложение показывало ложное «закрыто», пока авария продолжалась.
+        limit оставлен как защита от патологического объёма (не должно
+        реалистично понадобиться в честном мониторинге).
         """
         try:
             self._ensure_login()
         except Exception as e:
             raise ConnectionError(f"Zabbix недоступен: {e}") from e
-
-        time_from = int((datetime.now() - timedelta(days=7)).timestamp())
 
         try:
             events = self.zapi.event.get(
@@ -86,7 +93,6 @@ class ZabbixClient(BaseZabbixClient):
                 source=0,
                 object=0,
                 value=1,
-                time_from=time_from,
                 sortfield="clock",
                 sortorder="DESC",
                 limit=limit,

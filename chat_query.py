@@ -9,10 +9,7 @@ chat_query.py — извлечение контекста для чата «Сп
 """
 from __future__ import annotations
 
-from collections import Counter
 from datetime import datetime, timedelta
-
-from models import Severity
 
 
 def _parse_days(question: str) -> int:
@@ -40,35 +37,28 @@ def build_context(question: str, incident_repo, config_repo) -> str:
     """Собирает компактный текстовый блок: агрегаты по всей истории +
     отфильтрованные по хосту/периоду записи. Именно этот текст уходит
     в промпт LLM как единственный источник фактов (модели явно
-    запрещается выдумывать то, чего здесь нет)."""
-    # limit с большим запасом (не претендует быть "вся история" как факт) —
-    # для точных заголовочных чисел ниже используем настоящие агрегаты
-    # репозитория (COUNT()/GROUP BY по всей таблице), а не длину этого списка,
-    # так что даже если он будет обрезан, сводка всё равно останется верной.
-    incidents = incident_repo.get_history(limit=5000)
-    configs = config_repo.get_history(limit=5000)
+    запрещается выдумывать то, чего здесь нет).
 
-    hosts = sorted({i.host for i in incidents} | {c.get("node", "") for c in configs if c.get("node")})
+    Раньше и распознавание хоста, и фильтрация по периоду делались
+    Python-фильтром по get_history(limit=5000) — хост, все упоминания
+    которого старше первых 5000 строк истории, не распознавался бы в
+    вопросе вообще, а «за всю историю» могло молча вернуть «не найдено»
+    при реально существующих старых данных. Теперь и список хостов, и
+    сама фильтрация — прямые запросы к БД (search/get_distinct_*),
+    не ограниченные окном выборки."""
+    hosts = sorted(set(incident_repo.get_distinct_hosts()) | set(config_repo.get_distinct_nodes()))
     target_host = _find_host(question, hosts)
     days = _parse_days(question)
     cutoff = datetime.now() - timedelta(days=days)
 
-    filtered_incidents = [i for i in incidents if i.timestamp >= cutoff]
-    if target_host:
-        filtered_incidents = [i for i in filtered_incidents if i.host == target_host]
-
-    filtered_configs = [
-        c for c in configs
-        if isinstance(c.get("saved_at"), datetime) and c["saved_at"] >= cutoff
-    ]
-    if target_host:
-        filtered_configs = [c for c in filtered_configs if c.get("node") == target_host]
+    filtered_incidents = incident_repo.search(since=cutoff, host=target_host, limit=5000)
+    filtered_configs = config_repo.search(since=cutoff, node=target_host, limit=5000)
 
     verification_stats = incident_repo.get_verification_stats()
     total = verification_stats["total"]
-    critical = sum(1 for i in incidents if i.severity in (Severity.HIGH, Severity.DISASTER))
+    critical = incident_repo.get_critical_count()
     top_hosts = sorted(incident_repo.get_stats_by_host().items(), key=lambda kv: kv[1], reverse=True)[:3]
-    risk_counts = Counter((c.get("ai_risk_level") or "UNKNOWN").upper() for c in configs)
+    risk_counts = config_repo.get_risk_counts()
 
     lines = [
         f"Сводка по всей истории: {total} инцидентов всего, {critical} критичных (высокая/авария).",

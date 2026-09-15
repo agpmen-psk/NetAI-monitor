@@ -29,23 +29,21 @@ def main():
         zabbix_client = MockZabbixClient(seed=42)
         oxidized_client = MockOxidizedClient(seed=42)
     else:
-        # ZabbixClient/OxidizedClient сами не ходят в сеть в конструкторе
-        # (подключение отложено до первого запроса) — try/except здесь лишь
-        # подстраховка на случай непредвиденной ошибки конфигурации (например,
-        # некорректный URL), чтобы недоступность оборудования или опечатка в
-        # настройках никогда не роняли приложение ещё до появления окна.
-        try:
-            zabbix_client = ZabbixClient(
-                url=settings.zabbix_url,
-                user=settings.zabbix_user,
-                password=settings.zabbix_password,
-            )
-        except Exception:
-            zabbix_client = MockZabbixClient(seed=42)
-        try:
-            oxidized_client = OxidizedClient(base_url=settings.oxidized_url)
-        except Exception:
-            oxidized_client = MockOxidizedClient(seed=42)
+        # ZabbixClient/OxidizedClient сами не ходят в сеть и ничего не
+        # валидируют в конструкторе (подключение отложено до первого
+        # запроса, см. zabbix_client.py/oxidized_client.py) — раньше здесь
+        # стоял try/except "на случай ошибки конфигурации", но обёртывать
+        # было нечего: оба конструктора — просто присваивание полей, они не
+        # бросают исключений ни при каком URL. Опечатка в настройках или
+        # недоступное оборудование проявится позже, как понятный
+        # ConnectionError из первого реального вызова (его уже ловят
+        # GUI-воркеры и realtime_service.py, не роняя всё приложение).
+        zabbix_client = ZabbixClient(
+            url=settings.zabbix_url,
+            user=settings.zabbix_user,
+            password=settings.zabbix_password,
+        )
+        oxidized_client = OxidizedClient(base_url=settings.oxidized_url)
 
     analyzer = get_analyzer(settings.ollama_host, settings.ollama_model)
 
