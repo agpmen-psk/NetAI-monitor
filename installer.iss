@@ -50,4 +50,4 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
 
 [Messages]
-russian.WelcomeLabel2=Будет установлено приложение [name/ver] для интеллектуального анализа сетевых инцидентов и конфигураций на локальной LLM.%n%nПеред запуском убедитесь, что установлены Ollama (https://ollama.com) и, для боевого режима с историей, PostgreSQL с расширением pgvector. Без них приложение всё равно запустится в демо-режиме на локальном SQLite-хранилище.
+russian.WelcomeLabel2=Будет установлено приложение [name/ver] для интеллектуального анализа сетевых инцидентов и конфигураций на локальной LLM.%n%nЭто тонкий клиент — вся обработка данных и модель выполняются на сервере предприятия. При первом запуске потребуется указать адрес сервера (например, http://адрес-сервера:8000) и войти под своей учётной записью, выданной администратором.
