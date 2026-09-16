@@ -48,6 +48,14 @@ DEFAULTS = {
     # Специально НЕ берётся из app_settings — иначе оператор с любого
     # десктопа мог бы случайно перевести серверную службу в демо-режим.
     "use_synthetic_data": False,
+    # "" | "off" | "flat" | "twin" — если пусто, режим выводится из
+    # старого use_synthetic_data (см. resolve_synthetic_mode), чтобы уже
+    # развёрнутые окружения не сломались без ручной правки конфига.
+    "synthetic_data_mode": "",
+    # Путь к топологии цифрового двойника — относительный ищется рядом с
+    # service_config.json (%PROGRAMDATA%\NetAI Monitor\), абсолютный — как есть.
+    "twin_topology_file": "network_topology.json",
+    "twin_incident_rate_per_day": 50,
     "poll_interval_seconds": 60,
     # На каком адресе/порту слушает api_server.py. 0.0.0.0 — на всех
     # интерфейсах сервера (десктоп-клиенты подключаются по IP сервера в
@@ -68,6 +76,20 @@ def config_dir() -> Path:
 
 def config_path() -> Path:
     return config_dir() / "service_config.json"
+
+
+def resolve_synthetic_mode(config: dict) -> str:
+    """'off' | 'flat' | 'twin'."""
+    mode = (config.get("synthetic_data_mode") or "").strip().lower()
+    if mode in ("off", "flat", "twin"):
+        return mode
+    return "flat" if config.get("use_synthetic_data") else "off"
+
+
+def twin_topology_path(config: dict) -> Path:
+    raw = config.get("twin_topology_file") or "network_topology.json"
+    path = Path(raw)
+    return path if path.is_absolute() else config_dir() / path
 
 
 def log_dir() -> Path:
