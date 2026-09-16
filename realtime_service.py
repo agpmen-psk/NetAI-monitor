@@ -43,7 +43,12 @@ from zabbix_client import ZabbixClient, MockZabbixClient
 from llm_client import get_analyzer
 from rag import EmbeddingClient, IncidentRAG
 from realtime_engine import RealtimeEngine
-from service_config import ensure_config_file, load_service_config, log_dir, config_path
+from service_config import (
+    ensure_config_file, load_service_config, log_dir, config_path,
+    resolve_synthetic_mode, twin_topology_path,
+)
+from topology import Topology
+from digital_twin import TwinZabbixClient
 from service_common import (
     setup_logging, acquire_single_instance_lock, connect_db_with_retry, sleep_with_interrupt,
 )
@@ -58,9 +63,29 @@ def _handle_stop(signum, frame) -> None:
     _running = False
 
 
-def _build_clients(config: dict):
-    if config["use_synthetic_data"]:
-        log.info("Режим синтетических данных — использую MockZabbixClient.")
+def _build_clients(config: dict, backend):
+    mode = resolve_synthetic_mode(config)
+    if mode == "twin":
+        topology_path = twin_topology_path(config)
+        if not topology_path.exists():
+            log.error(
+                "Режим цифрового двойника включён (synthetic_data_mode=twin), но файл "
+                "топологии не найден: %s — положите network_topology.json рядом с "
+                "service_config.json. Работаю с пустой топологией (инцидентов не будет).",
+                topology_path,
+            )
+            topology = Topology(sites={}, redundancy_groups={}, nodes=[])
+        else:
+            topology = Topology.load(topology_path)
+            log.info("Цифровой двойник: загружено %d узлов топологии из %s.",
+                      len(topology.nodes), topology_path)
+        zabbix_client = TwinZabbixClient(
+            repo=backend.twin, topology=topology,
+            incident_rate_per_day=float(config.get("twin_incident_rate_per_day", 50)),
+            poll_interval_seconds=max(10, int(config["poll_interval_seconds"])),
+        )
+    elif mode == "flat":
+        log.info("Режим плоской синтетики — использую MockZabbixClient.")
         zabbix_client = MockZabbixClient(seed=42)
     else:
         if not config["zabbix_url"]:
@@ -111,7 +136,7 @@ def main() -> None:
     # БД: API-служба работает на той же машине и читает service_config.json
     # напрямую (см. api_server.py: GET/PUT /admin/service-config) — один
     # источник истины вместо синхронизации между файлом и таблицей.
-    zabbix_client, analyzer = _build_clients(config)
+    zabbix_client, analyzer = _build_clients(config, backend)
 
     rag = None
     embedder = EmbeddingClient(host=config["ollama_host"], model=config["embedding_model"])
