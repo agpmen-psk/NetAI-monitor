@@ -46,7 +46,9 @@ from llm_client import get_analyzer
 from rag import EmbeddingClient, IncidentRAG, ConfigRAG
 from mock_oxidized_client import MockOxidizedClient
 from oxidized_client import OxidizedClient
-from service_config import ensure_config_file, load_service_config
+from service_config import ensure_config_file, load_service_config, resolve_synthetic_mode, twin_topology_path
+from topology import Topology
+from digital_twin import TwinOxidizedClient
 from service_common import (
     setup_logging, acquire_single_instance_lock, connect_db_with_retry, sleep_with_interrupt,
 )
@@ -65,7 +67,19 @@ def _handle_stop(signum, frame) -> None:
 
 
 def _build_oxidized_client(config: dict):
-    if config["use_synthetic_data"]:
+    mode = resolve_synthetic_mode(config)
+    if mode == "twin":
+        topology_path = twin_topology_path(config)
+        if not topology_path.exists():
+            log.error(
+                "Режим цифрового двойника включён, но файл топологии не найден: %s",
+                topology_path,
+            )
+            topology = Topology(sites={}, redundancy_groups={}, nodes=[])
+        else:
+            topology = Topology.load(topology_path)
+        return TwinOxidizedClient(topology=topology)
+    if mode == "flat":
         return MockOxidizedClient(seed=42)
     return OxidizedClient(base_url=config["oxidized_url"])
 
