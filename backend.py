@@ -29,6 +29,7 @@ class Backend(NamedTuple):
     users: object
     sessions: object
     jobs: object
+    twin: object
 
 
 def _resolve_dsn(explicit_dsn: str | None = None) -> str:
@@ -46,6 +47,7 @@ def create_postgres_backend(dsn: str | None = None) -> Backend:
     from db import (
         Database, IncidentRepository, ConfigDiffRepository, SettingsRepository,
         ServiceStatusRepository, UserRepository, SessionRepository, JobQueueRepository,
+        TwinIncidentRepository,
     )
 
     db = Database(dsn=_resolve_dsn(dsn))
@@ -61,4 +63,5 @@ def create_postgres_backend(dsn: str | None = None) -> Backend:
         users=UserRepository(db),
         sessions=SessionRepository(db),
         jobs=JobQueueRepository(db),
+        twin=TwinIncidentRepository(db),
     )

@@ -145,6 +145,26 @@ CREATE TABLE IF NOT EXISTS job_queue (
 );
 CREATE INDEX IF NOT EXISTS idx_job_queue_pending ON job_queue (status, created_at)
     WHERE status = 'pending';
+
+-- Внутреннее состояние цифрового двойника (см. digital_twin.py) — какие
+-- узлы сети сейчас "сломаны" в симуляции. Отдельно от incidents (та
+-- хранит уже проанализированные LLM и проверенные инженером записи) —
+-- сюда пишет только TwinZabbixClient, наружу (в GUI) не видна напрямую.
+CREATE TABLE IF NOT EXISTS twin_incidents (
+    id              TEXT PRIMARY KEY,
+    host            TEXT NOT NULL,
+    problem_name    TEXT NOT NULL,
+    severity        INTEGER NOT NULL,
+    item_key        TEXT,
+    last_value      TEXT,
+    started_at      TIMESTAMP NOT NULL DEFAULT now(),
+    resolve_at      TIMESTAMP,
+    is_root_cause   BOOLEAN NOT NULL DEFAULT true,
+    caused_by       TEXT,
+    resolved        BOOLEAN NOT NULL DEFAULT false,
+    resolved_at     TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_twin_incidents_open ON twin_incidents (resolved) WHERE resolved = false;
 """
 
 DEFAULT_SETTINGS = {
@@ -260,6 +280,79 @@ class ServiceStatusRepository:
             with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
                 cur.execute("SELECT * FROM service_heartbeat ORDER BY id")
                 return [dict(r) for r in cur.fetchall()]
+
+
+class TwinIncidentRepository:
+    """Внутреннее состояние симуляции цифрового двойника (см.
+    digital_twin.py) — какие узлы сейчас «сломаны» в симулированном мире.
+    Резолюция каскадов пересчитывается заново на каждый тик по топологии
+    (см. TwinZabbixClient._reconcile_cascades), а не по цепочке caused_by —
+    caused_by хранится только для описательного текста."""
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def create(self, incident_id: str, host: str, problem_name: str, severity: int,
+               item_key: str, last_value: str, resolve_at, is_root_cause: bool,
+               caused_by: str | None) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO twin_incidents
+                    (id, host, problem_name, severity, item_key, last_value,
+                     resolve_at, is_root_cause, caused_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (incident_id, host, problem_name, severity, item_key, last_value,
+                     resolve_at, is_root_cause, caused_by),
+                )
+            conn.commit()
+
+    def get_open(self) -> list[dict]:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM twin_incidents WHERE resolved = false")
+                return [dict(r) for r in cur.fetchall()]
+
+    def get_due_root_causes(self, now) -> list[dict]:
+        with self.db._connect() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM twin_incidents WHERE resolved = false "
+                    "AND is_root_cause = true AND resolve_at IS NOT NULL AND resolve_at <= %s",
+                    (now,),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def resolve(self, incident_id: str) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE twin_incidents SET resolved = true, resolved_at = now() WHERE id = %s",
+                    (incident_id,),
+                )
+            conn.commit()
+
+    def resolve_by_host(self, host: str) -> None:
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE twin_incidents SET resolved = true, resolved_at = now() "
+                    "WHERE host = %s AND resolved = false",
+                    (host,),
+                )
+            conn.commit()
+
+    def clear_all(self) -> int:
+        """Полный сброс симуляции — на случай, если мир «заклинило» и проще
+        начать с чистого листа, чем разбирать вручную."""
+        with self.db._connect() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM twin_incidents")
+                deleted = cur.rowcount
+            conn.commit()
+        return deleted
 
 
 class UserRepository:
