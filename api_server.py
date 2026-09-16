@@ -35,7 +35,9 @@ from mock_oxidized_client import MockOxidizedClient
 from models import Incident, Severity
 from oxidized_client import OxidizedClient
 from service_common import setup_logging, connect_db_with_retry
-from service_config import load_service_config, save_service_config
+from service_config import load_service_config, save_service_config, resolve_synthetic_mode, twin_topology_path
+from topology import Topology
+from digital_twin import TwinOxidizedClient
 
 log = logging.getLogger("api-server")
 
@@ -158,10 +160,19 @@ async def lifespan(app: FastAPI):
     config = load_service_config()
     backend = connect_db_with_retry(config["postgres_dsn"], lambda: True, log)
 
-    oxidized_client = (
-        MockOxidizedClient(seed=42) if config["use_synthetic_data"]
-        else OxidizedClient(base_url=config["oxidized_url"])
-    )
+    mode = resolve_synthetic_mode(config)
+    if mode == "twin":
+        topology_path = twin_topology_path(config)
+        if not topology_path.exists():
+            log.error("Режим цифрового двойника включён, но файл топологии не найден: %s", topology_path)
+            topology = Topology(sites={}, redundancy_groups={}, nodes=[])
+        else:
+            topology = Topology.load(topology_path)
+        oxidized_client = TwinOxidizedClient(topology=topology)
+    elif mode == "flat":
+        oxidized_client = MockOxidizedClient(seed=42)
+    else:
+        oxidized_client = OxidizedClient(base_url=config["oxidized_url"])
 
     if backend.users.count() == 0:
         # Бутстрап первого администратора — иначе войти в систему не
