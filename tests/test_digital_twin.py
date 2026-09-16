@@ -114,6 +114,40 @@ def test_cascade_resolves_when_root_resolves():
         _cleanup(backend)
 
 
+def test_resolve_by_host_does_not_touch_fresh_root_cause():
+    backend = create_postgres_backend()
+    _cleanup(backend)
+    try:
+        topology = _prefixed_topology()
+        root = f"{TEST_HOST_PREFIX}ROOT"
+        core = f"{TEST_HOST_PREFIX}CORE"
+        client = TwinZabbixClient(
+            repo=backend.twin, topology=topology, incident_rate_per_day=0,
+            poll_interval_seconds=60, rng=random.Random(1),
+        )
+        backend.twin.create(
+            incident_id="twindigtest-forced-root-3", host=root, problem_name="Forced down",
+            severity=5, item_key="", last_value="", resolve_at=None,
+            is_root_cause=True, caused_by=None,
+        )
+        client.get_active_problems()  # создаёт каскадную запись на CORE
+
+        # Независимая, реальная проблема прилетает на тот же хост, что и
+        # каскадная запись.
+        backend.twin.create(
+            incident_id="twindigtest-forced-core-real", host=core, problem_name="Real independent problem",
+            severity=5, item_key="", last_value="", resolve_at=None,
+            is_root_cause=True, caused_by=None,
+        )
+        client.get_active_problems()  # не должен закрыть свежий root-cause на CORE
+
+        open_rows = [r for r in backend.twin.get_open() if r["host"] == core]
+        assert len(open_rows) == 1
+        assert open_rows[0]["is_root_cause"] is True
+    finally:
+        _cleanup(backend)
+
+
 def test_empty_topology_does_not_crash():
     backend = create_postgres_backend()
     empty_topology = Topology(sites={}, redundancy_groups={}, nodes=[])

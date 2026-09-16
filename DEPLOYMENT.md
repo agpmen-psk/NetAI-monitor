@@ -173,14 +173,42 @@ Tunnel, port-forward + сертификат и т.п.) не влияет на с
 ```
 
 `twin_topology_file` ищется рядом с `service_config.json`
-(`%PROGRAMDATA%\NetAI Monitor\`), если путь не абсолютный. Формат файла и
-генератор из реестра оборудования — см.
-`twin_data/build_topology.py` в репозитории (сам файл с реальными данными
-сети в git не попадает — конфиденциально, копируется на сервер вручную).
+(`%PROGRAMDATA%\NetAI Monitor\`), если путь не абсолютный. Сам файл
+топологии в git не попадает (конфиденциальные данные реальной сети,
+`twin_data/` в `.gitignore`) — готовится и копируется на сервер вручную
+администратором. Формат (подробнее — раздел «Формат network_topology.json»
+в `docs/superpowers/specs/2026-09-16-digital-twin-design.md`):
+
+```json
+{
+  "sites": {"a": "Site A"},
+  "redundancy_groups": {},
+  "nodes": [
+    {"name": "ROOT", "role": "border_router", "criticality": "HIGH", "depends_on": []},
+    {"name": "CORE", "role": "core_switch", "criticality": "HIGH", "depends_on": ["ROOT"]},
+    {"name": "LEAF1", "role": "access_switch", "criticality": "LOW", "depends_on": ["CORE"]}
+  ]
+}
+```
+
+`sites` — словарь код площадки → название. `redundancy_groups` — группы
+узлов-дублёров (живо, пока жив хотя бы один член группы); `depends_on` узла
+может ссылаться и на имя узла, и на ключ группы. `nodes[].name` обязателен;
+остальные поля (`role`, `vendor`, `model`, `site`, `ip`, `criticality`,
+`depends_on`, `purpose`) необязательны и по умолчанию пустые/`MEDIUM`.
+Битый JSON или узел без `name` не роняют службы — логируется ошибка,
+и служба работает с пустой топологией (см. `topology.py:load_or_empty`).
+
+`synthetic_data_mode`, `twin_topology_file` и `twin_incident_rate_per_day`
+можно также задать через `PUT /admin/service-config` — то есть из вкладки
+**Настройки** → «Настройки сервера», без ручного редактирования файла.
 
 `synthetic_data_mode` заменяет старый `use_synthetic_data`
 (`true`/`false` по-прежнему работают, если `synthetic_data_mode` не
-задан — `true` эквивалентно `"flat"`).
+задан — `true` эквивалентно `"flat"`). Если `synthetic_data_mode` задан
+явно (через файл конфигурации или новые поля admin API/GUI), он
+приоритетнее — старый чекбокс «синтетические данные» на вкладке
+«Настройки» десктоп-приложения в этом случае не имеет эффекта.
 
 ---
 

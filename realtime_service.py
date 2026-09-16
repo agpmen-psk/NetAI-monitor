@@ -67,16 +67,8 @@ def _build_clients(config: dict, backend):
     mode = resolve_synthetic_mode(config)
     if mode == "twin":
         topology_path = twin_topology_path(config)
-        if not topology_path.exists():
-            log.error(
-                "Режим цифрового двойника включён (synthetic_data_mode=twin), но файл "
-                "топологии не найден: %s — положите network_topology.json рядом с "
-                "service_config.json. Работаю с пустой топологией (инцидентов не будет).",
-                topology_path,
-            )
-            topology = Topology(sites={}, redundancy_groups={}, nodes=[])
-        else:
-            topology = Topology.load(topology_path)
+        topology = Topology.load_or_empty(topology_path, log)
+        if topology.nodes:
             log.info("Цифровой двойник: загружено %d узлов топологии из %s.",
                       len(topology.nodes), topology_path)
         zabbix_client = TwinZabbixClient(

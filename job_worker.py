@@ -70,14 +70,7 @@ def _build_oxidized_client(config: dict):
     mode = resolve_synthetic_mode(config)
     if mode == "twin":
         topology_path = twin_topology_path(config)
-        if not topology_path.exists():
-            log.error(
-                "Режим цифрового двойника включён, но файл топологии не найден: %s",
-                topology_path,
-            )
-            topology = Topology(sites={}, redundancy_groups={}, nodes=[])
-        else:
-            topology = Topology.load(topology_path)
+        topology = Topology.load_or_empty(topology_path, log)
         return TwinOxidizedClient(topology=topology)
     if mode == "flat":
         return MockOxidizedClient(seed=42)

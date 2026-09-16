@@ -53,6 +53,26 @@ class Topology:
             ))
         return cls(sites=data.get("sites", {}), redundancy_groups=redundancy_groups, nodes=nodes)
 
+    @classmethod
+    def load_or_empty(cls, path, log) -> "Topology":
+        """Как .load(), но никогда не бросает исключение: битый/повреждённый
+        JSON (или узел без обязательного поля) логируется как ошибка, и
+        возвращается пустая топология — так же, как при отсутствующем файле.
+        Используется всеми тремя серверными процессами при старте: топологию
+        правит вручную администратор на сервере, и один хвостовой JSON/
+        пропущенное поле не должны ронять всю службу."""
+        if not Path(path).exists():
+            log.error(
+                "Режим цифрового двойника включён, но файл топологии не найден: %s — "
+                "положите network_topology.json рядом с service_config.json.", path,
+            )
+            return cls(sites={}, redundancy_groups={}, nodes=[])
+        try:
+            return cls.load(path)
+        except Exception as e:
+            log.error("Не удалось разобрать файл топологии %s: %s — работаю с пустой топологией.", path, e)
+            return cls(sites={}, redundancy_groups={}, nodes=[])
+
     def _dependency_satisfied(self, dep: str, down_hosts: set[str]) -> bool:
         """dep — имя узла ИЛИ ключ redundancy_groups. Группа резервирования
         жива, пока жив хотя бы один её член (семантика «ИЛИ» внутри группы)."""

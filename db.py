@@ -335,11 +335,18 @@ class TwinIncidentRepository:
             conn.commit()
 
     def resolve_by_host(self, host: str) -> None:
+        """Закрывает только КАСКАДНЫЕ (is_root_cause = false) открытые записи
+        на хосте — используется _reconcile_cascades, когда узел больше не
+        топологически недостижим. Root-cause записи этим методом никогда не
+        трогаем: иначе свежий независимый root-cause на том же хосте, что и
+        устаревшая каскадная запись (host совпадает), закрывался бы вместе с
+        ней. Root-cause закрывается только через resolve()/get_due_root_causes
+        по собственному таймеру resolve_at."""
         with self.db._connect() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     "UPDATE twin_incidents SET resolved = true, resolved_at = now() "
-                    "WHERE host = %s AND resolved = false",
+                    "WHERE host = %s AND resolved = false AND is_root_cause = false",
                     (host,),
                 )
             conn.commit()
